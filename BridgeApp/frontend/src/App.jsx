@@ -64,13 +64,26 @@ function App() {
   // Handler for Retry Connection button
   const handleRetryClick = async () => {
     console.log("Attempting to reconnect...");
+    setIsReconnecting(true);
+    setReconnectResults(null); // Clear previous results
+    setReconnectError(null);   // Clear previous errors
     try {
-        const result = await AttemptReconnect(); // Call the Go method
+        // Call the Go method - Assuming it now takes specific flags,
+        // but the original call didn't pass any. Let's assume the backend
+        // handles default behavior or we adjust if needed.
+        // For now, calling without args as before, assuming backend defaults.
+        const result = await AttemptReconnect(true, true, true); // Explicitly retry all for clarity
         console.log("AttemptReconnect direct result:", result);
-        // The actual status update and notification will be driven by backend state changes and events
+        setReconnectResults(result); // Store the detailed results
+        // Optionally trigger a manual status refresh immediately
+        // fetchStatus(); // Uncomment if you want faster UI update than polling interval
     } catch (error) {
         console.error("Error calling AttemptReconnect:", error);
-        alert("Failed to initiate reconnection attempt: " + (error?.message || error));
+        const errorMsg = "Failed to initiate reconnection attempt: " + (error?.message || error);
+        setReconnectError(errorMsg); // Store the error message
+        // alert(errorMsg); // Replaced alert with state update
+    } finally {
+        setIsReconnecting(false); // Ensure loading state is turned off
     }
   };
 
@@ -92,11 +105,18 @@ function App() {
   useEffect(() => {
     // Listener for "addonPingSuccess"
     const handlePingSuccess = () => {
-        console.log('Frontend: "addonPingSuccess" event received. Showing alert.');
-        alert("Ping received from transmitter!");
+    	console.log('Frontend: "addonPingSuccess" event received. Showing alert.');
+    	alert("Ping received from transmitter!");
     };
     EventsOn("addonPingSuccess", handlePingSuccess); // Keep existing listener
-
+  
+    // Listener for "hedgebotPingSuccess" - NEW
+    const handleHedgebotPingSuccess = () => {
+    	console.log('Frontend: "hedgebotPingSuccess" event received. Showing alert.');
+    	alert("Ping received from Hedgebot!"); // Specific message for Hedgebot
+    };
+    EventsOn("hedgebotPingSuccess", handleHedgebotPingSuccess);
+  
     // Listener for "addonRetryResult" - Keep existing listener
     const handleAddonRetryResult = (data) => {
         console.log("Frontend: 'addonRetryResult' event received:", data);
@@ -211,15 +231,33 @@ function App() {
         </button>
 
         {/* Feedback UI for Retry Connection */}
-        <div className="retry-feedback" style={{ marginTop: '16px' }}>
-          {isCheckingStatus && (
-            <div className="retry-status-msg">Checking connection status...</div>
-          )}
+        {/* Feedback UI for Retry Connection */}
+        <div className="retry-feedback" style={{ marginTop: '16px', textAlign: 'left' }}>
           {isReconnecting && (
             <div className="retry-status-msg">Attempting reconnect...</div>
           )}
           {reconnectError && (
-            <div className="retry-error" style={{ color: 'red' }}>{reconnectError}</div>
+            <div className="retry-error" style={{ color: 'red', marginBottom: '8px' }}>{reconnectError}</div>
+          )}
+          {reconnectResults && !isReconnecting && (
+            <div className="retry-results">
+              <h4>Reconnection Attempt Results:</h4>
+              {reconnectResults.bridge && reconnectResults.bridge.attempted && (
+                <p style={{ margin: '2px 0', color: reconnectResults.bridge.success ? 'green' : 'orange' }}>
+                  <strong>Bridge:</strong> {reconnectResults.bridge.message}
+                </p>
+              )}
+              {reconnectResults.hedgebot && reconnectResults.hedgebot.attempted && (
+                <p style={{ margin: '2px 0', color: reconnectResults.hedgebot.success ? 'green' : 'orange' }}>
+                  <strong>Hedgebot:</strong> {reconnectResults.hedgebot.message}
+                </p>
+              )}
+              {reconnectResults.addon && reconnectResults.addon.attempted && (
+                <p style={{ margin: '2px 0', color: reconnectResults.addon.success ? 'green' : 'orange' }}>
+                  <strong>Addon/Transmitter:</strong> {reconnectResults.addon.message}
+                </p>
+              )}
+            </div>
           )}
         </div>
       </div>

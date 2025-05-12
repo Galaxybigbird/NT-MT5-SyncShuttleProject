@@ -30,7 +30,8 @@ type App struct {
 	lastAddonRequestTime time.Time
 	addonStatusMux       sync.Mutex
 	// HedgeBot connection tracking
-	hedgebotStatusMux sync.Mutex // Protects hedgebotActive
+	hedgebotStatusMux sync.Mutex // Protects hedgebotActive and hedgebotLastPing
+	hedgebotLastPing  time.Time  // Timestamp of the last successful ping from Hedgebot
 }
 
 type Trade struct {
@@ -241,37 +242,51 @@ func (a *App) getTradeHandler(w http.ResponseWriter, r *http.Request) {
 // healthHandler provides status information
 func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 	// Read source query parameter
-	sourceQuery := r.URL.Query().Get("source")
+	sourceQuery := r.URL.Query().Get("source") // e.g., "hedgebot", "addon", or ""
 
 	// --- HedgeBot Ping Tracking ---
 	if sourceQuery == "hedgebot" {
-		log.Printf("Health check ping from source: %s", sourceQuery)
+		log.Printf("DEBUG: healthHandler - Received ping with source: %s", sourceQuery) // More specific log
+		var statusChanged bool = false                                                  // Track if status actually changed
 		a.hedgebotStatusMux.Lock()
 		// Set hedgebotActive to true if it wasn't already, and emit event ONCE
 		if !a.hedgebotActive {
+			log.Println("DEBUG: healthHandler - Updating hedgebotActive to true") // Log status change
 			log.Println("HedgeBot connection established via /health?source=hedgebot ping.")
 			a.hedgebotActive = true
 			// Emit event ONLY when status changes from false to true
-			runtime.EventsEmit(a.ctx, "hedgebotStatusChanged", map[string]interface{}{"active": true})
+			statusChanged = true
 		}
+		a.hedgebotLastPing = time.Now() // Update last ping time on every successful ping
 		// Status remains true after the first ping. No further events needed for subsequent pings.
 		a.hedgebotStatusMux.Unlock()
-	} else if sourceQuery != "" {
-		log.Printf("Health check ping from source: %s", sourceQuery)
+
+		// Emit status change event if it happened
+		if statusChanged {
+			runtime.EventsEmit(a.ctx, "hedgebotStatusChanged", map[string]interface{}{"active": true})
+		}
+		// Emit a specific event for hedgebot ping success
+		runtime.EventsEmit(a.ctx, "hedgebotPingSuccess") // New event for hedgebot
+
+	} else if sourceQuery == "addon" || sourceQuery == "" { // Treat "addon" or empty source as Addon ping
+		// Log pings from other known sources (like 'addon' if implemented)
+		log.Printf("DEBUG: healthHandler - Received ping treated as Addon (source: '%s')", sourceQuery)
+
+		// --- Addon connection tracking for /health endpoint --- CORRECTED ---
+		a.addonStatusMux.Lock()
+		a.addonConnected = true
+		a.lastAddonRequestTime = time.Now()
+		log.Printf("DEBUG: healthHandler - Correctly updating addonConnected=true for source '%s'", sourceQuery)
+		a.addonStatusMux.Unlock()
+		// --- End Addon connection tracking ---
+
+		// Emit event ONLY for successful ADDON ping
+		runtime.EventsEmit(a.ctx, "addonPingSuccess") // Moved inside Addon condition
+
 	} else {
-		log.Printf("Health check ping: source parameter not provided")
+		// Log pings from unknown sources
+		log.Printf("DEBUG: healthHandler - Received ping from unknown source: %s", sourceQuery)
 	}
-
-	// --- Addon connection tracking for /health endpoint --- UNCHANGED ---
-	a.addonStatusMux.Lock()
-	a.addonConnected = true
-	a.lastAddonRequestTime = time.Now()
-	log.Println("DEBUG: healthCheckHandler - Addon ping detected, addonConnected SET to true, lastAddonRequestTime updated")
-	a.addonStatusMux.Unlock()
-	// --- End Addon connection tracking ---
-
-	// Emit event for successful ping - UNCHANGED
-	runtime.EventsEmit(a.ctx, "addonPingSuccess")
 
 	// Prepare status response
 	a.queueMux.Lock() // Lock for accessing queue/trade state
@@ -423,15 +438,37 @@ func (a *App) AttemptReconnect(retryBridge bool, retryHedgebot bool, retryAddon 
 	// --- Handle Hedgebot Reconnection ---
 	if retryHedgebot {
 		hedgebotStatus.attempted = true
-		a.hedgebotStatusMux.Lock() // Use the correct mutex for hedgebotActive
-		if a.hedgebotActive {
-			hedgebotStatus.success = true
-			hedgebotStatus.message = "Hedgebot is marked as active (ping has been received at least once)."
-		} else {
-			hedgebotStatus.success = false // If never received a ping, it's inactive.
-			hedgebotStatus.message = "Hedgebot is marked as inactive. Waiting for first /health?source=hedgebot ping."
-		}
+		hedgebotStatus.message = "Checking Hedgebot status based on last ping time..." // Initial message
+		a.hedgebotStatusMux.Lock()                                                     // Use the correct mutex
+		lastPingTime := a.hedgebotLastPing
+		isActive := a.hedgebotActive // Still useful to know if *ever* connected
 		a.hedgebotStatusMux.Unlock()
+
+		if !lastPingTime.IsZero() {
+			timeSinceLastPing := time.Since(lastPingTime)
+			pingThreshold := 60 * time.Second // Consider ping recent if within 60 seconds
+			log.Printf("DEBUG: AttemptReconnect - Time since last Hedgebot ping: %s", timeSinceLastPing)
+
+			if timeSinceLastPing <= pingThreshold {
+				hedgebotStatus.success = true
+				hedgebotStatus.message = fmt.Sprintf("Hedgebot ping received recently (%s ago). Connection verified.", timeSinceLastPing.Round(time.Second))
+				log.Println("Hedgebot connection verified based on recent ping.")
+			} else {
+				hedgebotStatus.success = false
+				hedgebotStatus.message = fmt.Sprintf("Hedgebot ping is stale (last received %s ago). Assumed disconnected.", timeSinceLastPing.Round(time.Second))
+				log.Println("Hedgebot connection assumed stale based on last ping time.")
+			}
+		} else {
+			// No ping ever received
+			hedgebotStatus.success = false
+			if isActive { // Should technically not happen if lastPingTime is Zero, but for safety
+				hedgebotStatus.message = "Hedgebot was active previously, but last ping time is missing. Assumed disconnected."
+				log.Println("Hedgebot state inconsistent (active but no last ping time). Assuming disconnected.")
+			} else {
+				hedgebotStatus.message = "No Hedgebot ping has ever been received. Waiting for first /health?source=hedgebot ping."
+				log.Println("Hedgebot connection never established (no pings received).")
+			}
+		}
 	} else {
 		hedgebotStatus.attempted = false
 		hedgebotStatus.success = nil // Remains nil as it's not attempted
