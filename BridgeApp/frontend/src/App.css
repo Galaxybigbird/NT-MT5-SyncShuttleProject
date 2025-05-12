@@ -1,0 +1,205 @@
+/* General body styling */
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #282c34; /* Dark background like screenshot */
+  color: white;
+  height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+/* Container for centering content */
+.container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  padding: 2rem;
+  box-sizing: border-box;
+}
+
+/* Main title styling */
+h1 {
+  font-size: 2rem;
+  margin-bottom: 2rem;
+  color: #61dafb; /* Light blue color for title */
+  text-align: center;
+}
+
+/* Card styling */
+.card {
+  background-color: #f5f5f5; /* Light background for the card */
+  color: #333; /* Dark text color inside the card */
+  border-radius: 8px;
+  padding: 1.5rem 2rem; /* Adjusted padding */
+  width: 100%;
+  max-width: 500px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+  text-align: left; /* Align text left inside card */
+}
+
+/* Status heading (h2) styling */
+.card h2 {
+  margin-top: 0;
+  margin-bottom: 0.5rem; /* Reduced from 1rem to 0.5rem */
+  font-size: 1.2rem;
+  color: #1a365d; /* Darker blue color we set before */
+  text-align: center; /* Center the status heading */
+  padding-bottom: 0.5rem;
+}
+
+/* Add border only to the last status h2 as a section separator */
+.card h2:nth-of-type(3) {
+  border-bottom: 1px solid #eee;
+  padding-bottom: 0.75rem; /* Reduced from 1rem to 0.75rem */
+  margin-bottom: 1.5rem; /* Kept the same to maintain spacing with State Info section */
+}
+
+/* Status text styling (healthy, disconnected, etc.) */
+.healthy, .connected {
+  color: #4caf50; /* Green */
+  font-weight: bold;
+}
+
+.disconnected, .inactive { /* Added .inactive */
+  color: #f44336; /* Red */
+  font-weight: bold;
+}
+
+.error {
+  color: #ff9800; /* Orange */
+  font-weight: bold;
+}
+
+.unknown {
+  color: #9e9e9e; /* Grey */
+  font-weight: bold;
+}
+
+/* Container for state items */
+.state-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem; /* Slightly reduced gap */
+  margin-bottom: 2rem;
+}
+
+/* Individual state item styling (label + value) */
+.state-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center; /* Vertically align items */
+  padding: 0.8rem 1rem; /* Adjusted padding */
+  background-color: white;
+  border: 1px solid #ddd; /* Add border */
+  border-radius: 4px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.state-item label {
+  font-weight: bold;
+  color: #555;
+  margin-right: 1rem; /* Add space between label and value */
+}
+
+.state-item span {
+  font-family: 'Courier New', Courier, monospace; /* Monospace font for values */
+  font-size: 1rem;
+  color: #000;
+}
+
+/* Reset button styling */
+.reset-btn {
+  display: block; /* Make button block level */
+  width: 100%; /* Make button full width */
+  background-color: #e53935; /* Red color */
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  margin-top: 1rem; /* Ensure margin from state items */
+  box-sizing: border-box; /* Include padding in width */
+}
+
+.reset-btn:hover {
+  background-color: #c62828; /* Darker red on hover */
+}
+
+/* Retry Connection button styling */
+.retry-btn {
+  display: block; /* Make button block level */
+  width: 100%; /* Make button full width */
+  background-color: #2196f3; /* Blue color */
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  margin-top: 1rem; /* Spacing from the reset button */
+  box-sizing: border-box; /* Include padding in width */
+}
+
+.retry-btn:hover {
+  background-color: #1976d2; /* Darker blue on hover */
+}
+
+/* Remove default root styling if not needed */
+#root {
+  /* Properties from previous CSS - remove if not applicable */
+  /* max-width: 1280px; */
+  /* margin: 0 auto; */
+  /* padding: 2rem; */
+  /* text-align: center; */
+}
+
+/* Styles for Status Alignment */
+.status-lines {
+  margin-bottom: 20px; /* Add some space below the status block */
+}
+
+.status-item {
+  display: flex;          /* Use flexbox for alignment */
+  justify-content: space-between; /* Space out label and value */
+  align-items: center;    /* Vertically center items */
+  margin-bottom: 8px;  /* Consistent spacing between items */
+  padding: 5px 0;       /* Add some padding */
+}
+
+.status-label {
+  font-weight: bold;
+  margin-right: 10px; /* Space between label and value */
+  min-width: 150px;   /* Ensure labels have enough space */
+  text-align: left;   /* Align label text to the left */
+}
+
+.status-value {
+  font-weight: normal;
+  padding: 2px 8px;    /* Padding inside the status box */
+  border-radius: 4px;  /* Rounded corners for the status box */
+  min-width: 60px;     /* Minimum width for the status value */
+  text-align: center;  /* Center text within the status box */
+}
+
+/* Specific status colors (assuming these exist or adjust as needed) */
+.healthy {
+  background-color: #28a745; /* Green */
+  color: white;
+}
+
+.disconnected {
+  background-color: #dc3545; /* Red */
+  color: white;
+}
