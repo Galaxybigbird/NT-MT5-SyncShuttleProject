@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -46,6 +48,19 @@ type Trade struct {
 	OrderType       string    `json:"order_type,omitempty"`       // ENTRY, TP, or SL
 	MeasurementPips int       `json:"measurement_pips,omitempty"` // Measurement in pips
 	RawMeasurement  float64   `json:"raw_measurement,omitempty"`  // Raw measurement value
+	Instrument      string    `json:"instrument_name,omitempty"`  // Original NinjaTrader instrument symbol
+	AccountName     string    `json:"account_name,omitempty"`     // Original NinjaTrader account name
+}
+
+// HedgeCloseNotification struct mirrors the JSON structure for hedge close notifications
+type HedgeCloseNotification struct {
+	EventType           string  `json:"event_type"`
+	BaseID              string  `json:"base_id"`
+	NTInstrumentSymbol  string  `json:"nt_instrument_symbol"`
+	NTAccountName       string  `json:"nt_account_name"`
+	ClosedHedgeQuantity float64 `json:"closed_hedge_quantity"`
+	ClosedHedgeAction   string  `json:"closed_hedge_action"`
+	Timestamp           string  `json:"timestamp"`
 }
 
 // NewApp creates a new App application struct
@@ -94,6 +109,7 @@ func (a *App) startServer() {
 	mux.HandleFunc("/log_trade", a.logTradeHandler)
 	mux.HandleFunc("/mt5/get_trade", a.getTradeHandler)
 	mux.HandleFunc("/health", a.healthHandler)
+	mux.HandleFunc("/notify_hedge_close", a.handleNotifyMT5HedgeClosure) // Renamed to match EA
 
 	a.server = &http.Server{
 		Addr:    "127.0.0.1:5000",
@@ -233,9 +249,118 @@ func (a *App) getTradeHandler(w http.ResponseWriter, r *http.Request) {
 
 		// NOTE: hedgebotConnected field removed. Status tracked via /health pings.
 
-		json.NewEncoder(w).Encode(trade)
+		// Construct the payload for the EA
+		eaPayload := map[string]interface{}{
+			"id":                   trade.ID,
+			"base_id":              trade.BaseID,
+			"time":                 trade.Time,
+			"action":               trade.Action,
+			"quantity":             trade.Quantity,
+			"price":                trade.Price,
+			"total_quantity":       trade.TotalQuantity,
+			"contract_num":         trade.ContractNum,
+			"order_type":           trade.OrderType,
+			"measurement_pips":     trade.MeasurementPips,
+			"raw_measurement":      trade.RawMeasurement,
+			"nt_instrument_symbol": trade.Instrument,  // Added new field
+			"nt_account_name":      trade.AccountName, // Added new field
+		}
+
+		// CRITICAL_DEBUG: Log JSON string before sending
+		jsonBytes, err := json.Marshal(eaPayload)
+		if err != nil {
+			log.Printf("CRITICAL_DEBUG: Error marshaling trade to JSON for debug: %v", err)
+		} else {
+			log.Printf("CRITICAL_DEBUG: JSON string to be sent to EA: %s", string(jsonBytes))
+		}
+
+		// Ensure Content-Type is set
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(eaPayload)
 	default:
+		w.Header().Set("Content-Type", "application/json") // Also set for "no_trade" for consistency
 		w.Write([]byte(`{"status":"no_trade"}`))
+	}
+}
+
+// handleNotifyMT5HedgeClosure handles hedge closure notifications from MT5 EA
+func (a *App) handleNotifyMT5HedgeClosure(w http.ResponseWriter, r *http.Request) {
+	log.Println("DEBUG: Entered handleNotifyMT5HedgeClosure")
+
+	if r.Method != http.MethodPost {
+		log.Printf("ERROR: Invalid request method for /notify_mt5_hedge_closure: %s", r.Method)
+		http.Error(w, "Invalid request method. Only POST is allowed.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Read the raw body first to forward it later
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("ERROR: Failed to read request body from /notify_mt5_hedge_closure: %v", err)
+		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close() // Close the original body
+
+	// Now unmarshal from the read bytes for validation and logging
+	var notification HedgeCloseNotification
+	if err := json.Unmarshal(bodyBytes, &notification); err != nil {
+		log.Printf("ERROR: Failed to decode JSON from /notify_mt5_hedge_closure: %v. Body: %s", err, string(bodyBytes))
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	// Basic Validation
+	if notification.EventType != "hedge_close_notification" {
+		log.Printf("ERROR: Invalid notification type: %s. Expected 'hedge_close_notification'. Body: %s", notification.EventType, string(bodyBytes))
+		http.Error(w, "Invalid notification type", http.StatusBadRequest)
+		return
+	}
+	if notification.BaseID == "" {
+		log.Printf("ERROR: Missing base_id in hedge_close_notification. Body: %s", string(bodyBytes))
+		http.Error(w, "Missing base_id", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("=== Received hedge_close_notification ===")
+	log.Printf("Base ID: %s, EventType: %s, Symbol: %s, Account: %s", notification.BaseID, notification.EventType, notification.NTInstrumentSymbol, notification.NTAccountName)
+	log.Printf("Closed Quantity: %.2f, Closed Action: %s, Timestamp: %s", notification.ClosedHedgeQuantity, notification.ClosedHedgeAction, notification.Timestamp)
+
+	// Forward to NinjaTrader Addon
+	ntAddonURL := "http://localhost:8081/notify_hedge_closed" // As per specification
+	req, err := http.NewRequest(http.MethodPost, ntAddonURL, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		log.Printf("ERROR: Failed to create request to NinjaTrader Addon: %v", err)
+		// Respond to MT5 EA with an error, as forwarding couldn't even be attempted properly
+		http.Error(w, "Internal server error: failed to create forwarding request", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second} // Use a timeout for the client
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("ERROR: Failed to forward hedge_close_notification to NinjaTrader Addon (%s): %v", ntAddonURL, err)
+		// Still respond 200 to MT5 EA as the BridgeApp processed it, but log the forwarding error.
+		// The problem is between Bridge and NT Addon, not MT5 and Bridge at this point.
+		// Alternatively, could send a 502 Bad Gateway or 504 Gateway Timeout if desired.
+		// For now, let's assume MT5 just needs to know Bridge got it.
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "received_by_bridge", "forwarding_status": "failed", "error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("Successfully forwarded hedge_close_notification for base_id: %s to NinjaTrader Addon. Status: %s", notification.BaseID, resp.Status)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "received_by_bridge", "forwarding_status": "success"})
+	} else {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("ERROR: NinjaTrader Addon responded with status %s for hedge_close_notification (base_id: %s). Response: %s", resp.Status, notification.BaseID, string(body))
+		// Again, respond 200 to MT5 EA, indicating Bridge received it but forwarding had issues.
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "received_by_bridge", "forwarding_status": "addon_error", "addon_status_code": resp.Status, "addon_response": string(body)})
 	}
 }
 

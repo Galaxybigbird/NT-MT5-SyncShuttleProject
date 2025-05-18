@@ -13,6 +13,8 @@ export namespace main {
 	    order_type?: string;
 	    measurement_pips?: number;
 	    raw_measurement?: number;
+	    instrument_name?: string;
+	    account_name?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Trade(source);
@@ -31,6 +33,8 @@ export namespace main {
 	        this.order_type = source["order_type"];
 	        this.measurement_pips = source["measurement_pips"];
 	        this.raw_measurement = source["raw_measurement"];
+	        this.instrument_name = source["instrument_name"];
+	        this.account_name = source["account_name"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

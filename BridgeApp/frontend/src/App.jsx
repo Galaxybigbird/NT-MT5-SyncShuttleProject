@@ -32,15 +32,25 @@ function App() {
       const currentStatusFromServer = await GetStatus();
 
       // Update general bridge status
-      setBridgeStatus(prevStatus => ({
-        ...prevStatus, // Keep existing state like netPosition etc.
-        bridgeActive: currentStatusFromServer?.bridgeActive ?? false,
-        addonConnected: currentStatusFromServer?.addonConnected ?? false, // Update addon status
-        netPosition: currentStatusFromServer?.netPosition ?? 0,
-        hedgeSize: currentStatusFromServer?.hedgeSize ?? 0,
-        queueSize: currentStatusFromServer?.queueSize ?? 0,
-        // tradeLogSenderActive: currentStatusFromServer?.tradeLogSenderActive ?? false, // Update if needed
-      }));
+      setBridgeStatus(prevStatus => {
+        const isAddonNewlyConnected =
+          (currentStatusFromServer?.addonConnected ?? false) && !prevStatus.addonConnected;
+        
+        // Log if Addon/Transmitter is newly connected
+        if (isAddonNewlyConnected) {
+          console.log("Addon/Transmitter connected.");
+        }
+
+        return {
+          ...prevStatus, // Keep existing state like netPosition etc.
+          bridgeActive: currentStatusFromServer?.bridgeActive ?? false,
+          addonConnected: currentStatusFromServer?.addonConnected ?? false, // Update addon status
+          netPosition: currentStatusFromServer?.netPosition ?? 0,
+          hedgeSize: currentStatusFromServer?.hedgeSize ?? 0,
+          queueSize: currentStatusFromServer?.queueSize ?? 0,
+          // tradeLogSenderActive: currentStatusFromServer?.tradeLogSenderActive ?? false, // Update if needed
+        };
+      });
 
       // Update specific HedgeBot status state based on polled data
       // This ensures the UI is correct even if the event is missed or before the first event
@@ -105,26 +115,20 @@ function App() {
   useEffect(() => {
     // Listener for "addonPingSuccess"
     const handlePingSuccess = () => {
-    	console.log('Frontend: "addonPingSuccess" event received. Showing alert.');
-    	alert("Ping received from transmitter!");
+    	// Ping logs removed to prevent console spam
     };
     EventsOn("addonPingSuccess", handlePingSuccess); // Keep existing listener
   
     // Listener for "hedgebotPingSuccess" - NEW
     const handleHedgebotPingSuccess = () => {
-    	console.log('Frontend: "hedgebotPingSuccess" event received. Showing alert.');
-    	alert("Ping received from Hedgebot!"); // Specific message for Hedgebot
+    	// Ping logs removed to prevent console spam
     };
     EventsOn("hedgebotPingSuccess", handleHedgebotPingSuccess);
   
-    // Listener for "addonRetryResult" - Keep existing listener
+    // Listener for "addonRetryResult" - Modified to use notification instead of alerts
     const handleAddonRetryResult = (data) => {
         console.log("Frontend: 'addonRetryResult' event received:", data);
-        if (data && data.message) {
-            alert(data.message);
-        } else {
-            alert("Received an addon reconnection result, but no message was provided.");
-        }
+        // Status change will be detected by the status polling
     };
     EventsOn("addonRetryResult", handleAddonRetryResult);
 
@@ -141,11 +145,13 @@ function App() {
     const handleHedgeBotStatusChange = (eventData) => {
       console.log("Frontend: 'hedgebotStatusChanged' event received:", eventData);
       if (eventData && typeof eventData.active === 'boolean') {
-        setIsHedgeBotActive(eventData.active);
-        if (eventData.active) {
-          // Show notification only when it becomes active
-          showNotification("HedgeBot connected", "success");
-        }
+        setIsHedgeBotActive((prevState) => {
+          // Log only when changing from disconnected to connected
+          if (eventData.active && !prevState) {
+            console.log("Hedgebot connected.");
+          }
+          return eventData.active;
+        });
         // Note: As per requirements, we don't show a notification or change status
         // back to inactive based on events alone. That would require a manual action.
       }
