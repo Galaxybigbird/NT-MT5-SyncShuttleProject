@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -63,6 +64,15 @@ type HedgeCloseNotification struct {
 	Timestamp           string  `json:"timestamp"`
 }
 
+// MT5TradeResult struct mirrors the JSON payload from MT5 EA trade execution results
+type MT5TradeResult struct {
+	Status  string  `json:"status"`
+	Ticket  uint64  `json:"ticket"` // ulong in MQL5 is usually uint64
+	Volume  float64 `json:"volume"`
+	IsClose bool    `json:"is_close"`
+	ID      string  `json:"id"`
+}
+
 // NewApp creates a new App application struct
 func NewApp() *App {
 	fmt.Println("DEBUG: app.go - In NewApp") // Added for debug
@@ -110,6 +120,7 @@ func (a *App) startServer() {
 	mux.HandleFunc("/mt5/get_trade", a.getTradeHandler)
 	mux.HandleFunc("/health", a.healthHandler)
 	mux.HandleFunc("/notify_hedge_close", a.handleNotifyMT5HedgeClosure) // Renamed to match EA
+	mux.HandleFunc("/mt5/trade_result", a.handleMT5TradeResult)          // New route for MT5 trade results
 
 	a.server = &http.Server{
 		Addr:    "127.0.0.1:5000",
@@ -326,6 +337,33 @@ func (a *App) handleNotifyMT5HedgeClosure(w http.ResponseWriter, r *http.Request
 	log.Printf("Base ID: %s, EventType: %s, Symbol: %s, Account: %s", notification.BaseID, notification.EventType, notification.NTInstrumentSymbol, notification.NTAccountName)
 	log.Printf("Closed Quantity: %.2f, Closed Action: %s, Timestamp: %s", notification.ClosedHedgeQuantity, notification.ClosedHedgeAction, notification.Timestamp)
 
+	// Update bridge state based on hedge closure
+	a.queueMux.Lock()
+	oldNT := a.netNT
+	oldHedge := a.hedgeLot
+
+	// Update net position based on the closed hedge action
+	if notification.ClosedHedgeAction == "buy" { // Closing a short hedge means increasing net long position
+		a.netNT += int(notification.ClosedHedgeQuantity)
+		log.Printf("Closing %.2f short hedge contracts. Net position: %d → %d", notification.ClosedHedgeQuantity, oldNT, a.netNT)
+	} else if notification.ClosedHedgeAction == "sell" { // Closing a long hedge means decreasing net long position
+		a.netNT -= int(notification.ClosedHedgeQuantity)
+		log.Printf("Closing %.2f long hedge contracts. Net position: %d → %d", notification.ClosedHedgeQuantity, oldNT, a.netNT)
+	}
+
+	// Update hedge size to match the new net position
+	desiredHedgeLot := float64(a.netNT)
+	if a.hedgeLot != desiredHedgeLot {
+		log.Printf("=== Hedge Position Update (from closure notification) ===")
+		log.Printf("Previous hedge size: %.2f", oldHedge)
+		log.Printf("New hedge size: %.2f", desiredHedgeLot)
+		a.hedgeLot = desiredHedgeLot
+	}
+	a.queueMux.Unlock()
+
+	// Emit event to UI to update displayed position/hedge size
+	runtime.EventsEmit(a.ctx, "positionUpdated", map[string]interface{}{"net_position": a.netNT, "hedge_size": a.hedgeLot})
+
 	// Forward to NinjaTrader Addon
 	ntAddonURL := "http://localhost:8081/notify_hedge_closed" // As per specification
 	req, err := http.NewRequest(http.MethodPost, ntAddonURL, bytes.NewBuffer(bodyBytes))
@@ -364,6 +402,43 @@ func (a *App) handleNotifyMT5HedgeClosure(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// handleMT5TradeResult handles trade execution results from MT5 EA
+func (a *App) handleMT5TradeResult(w http.ResponseWriter, r *http.Request) {
+	log.Println("DEBUG: Entered handleMT5TradeResult")
+
+	if r.Method != http.MethodPost {
+		log.Printf("ERROR: Invalid request method for /mt5/trade_result: %s. Expected POST.", r.Method)
+		http.Error(w, "Invalid request method. Only POST is allowed.", http.StatusMethodNotAllowed)
+		return
+	}
+	defer r.Body.Close() // Ensure the request body is closed
+
+	var tradeResult MT5TradeResult
+	// It's good practice to limit the size of the request body to prevent potential DoS attacks.
+	// For example: r.Body = http.MaxBytesReader(w, r.Body, 1024*10) // 10KB limit
+
+	// Decode the JSON payload
+	err := json.NewDecoder(r.Body).Decode(&tradeResult)
+	if err != nil {
+		// If decoding fails, the body might have already been partially read or be in an error state.
+		log.Printf("ERROR: Failed to decode JSON from /mt5/trade_result: %v. Check incoming payload.", err)
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Received MT5 Trade Result: Status: '%s', Ticket: %d, Volume: %.2f, IsClose: %t, ID: '%s'",
+		tradeResult.Status, tradeResult.Ticket, tradeResult.Volume, tradeResult.IsClose, tradeResult.ID)
+
+	// Respond to the MT5 EA
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, writeErr := w.Write([]byte("MT5 trade result received"))
+	if writeErr != nil {
+		// Log error if writing response fails, but status has already been sent.
+		log.Printf("ERROR: Failed to write response body for /mt5/trade_result: %v", writeErr)
+	}
+}
+
 // healthHandler provides status information
 func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 	// Read source query parameter
@@ -371,8 +446,8 @@ func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	// --- HedgeBot Ping Tracking ---
 	if sourceQuery == "hedgebot" {
-		log.Printf("DEBUG: healthHandler - Received ping with source: %s", sourceQuery) // More specific log
-		var statusChanged bool = false                                                  // Track if status actually changed
+		// log.Printf("DEBUG: healthHandler - Received ping with source: %s", sourceQuery) // More specific log
+		var statusChanged bool = false // Track if status actually changed
 		a.hedgebotStatusMux.Lock()
 		// Set hedgebotActive to true if it wasn't already, and emit event ONCE
 		if !a.hedgebotActive {
@@ -393,15 +468,40 @@ func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 		// Emit a specific event for hedgebot ping success
 		runtime.EventsEmit(a.ctx, "hedgebotPingSuccess") // New event for hedgebot
 
+		// --- Process open_positions from HedgeBot ---
+		openPositionsStr := r.URL.Query().Get("open_positions")
+		if openPositionsStr != "" {
+			openPositions, err := strconv.Atoi(openPositionsStr)
+			if err == nil {
+				if openPositions == 0 {
+					a.queueMux.Lock() // Acquire lock before modifying shared state
+					if a.netNT != 0 || a.hedgeLot != 0.0 {
+						log.Println("DEBUG: HedgeBot reported 0 open positions. Resetting net position and hedge size.")
+						a.netNT = 0
+						a.hedgeLot = 0.0
+						// Optionally emit an event to the UI to force an update
+						runtime.EventsEmit(a.ctx, "positionReset", map[string]interface{}{"net_position": 0, "hedge_size": 0.0})
+					}
+					a.queueMux.Unlock() // Release lock
+				}
+				// If openPositions is not 0, we don't reset here.
+				// The net position and hedge size are updated by the logTradeHandler based on individual trades.
+				// This reset logic is specifically for the case where the hedgebot confirms *all* positions are closed.
+			} else {
+				log.Printf("ERROR: Failed to parse open_positions query parameter '%s': %v", openPositionsStr, err)
+			}
+		}
+		// --- End Process open_positions ---
+
 	} else if sourceQuery == "addon" || sourceQuery == "" { // Treat "addon" or empty source as Addon ping
 		// Log pings from other known sources (like 'addon' if implemented)
-		log.Printf("DEBUG: healthHandler - Received ping treated as Addon (source: '%s')", sourceQuery)
+		// log.Printf("DEBUG: healthHandler - Received ping treated as Addon (source: '%s')", sourceQuery)
 
 		// --- Addon connection tracking for /health endpoint --- CORRECTED ---
 		a.addonStatusMux.Lock()
 		a.addonConnected = true
 		a.lastAddonRequestTime = time.Now()
-		log.Printf("DEBUG: healthHandler - Correctly updating addonConnected=true for source '%s'", sourceQuery)
+		// log.Printf("DEBUG: healthHandler - Correctly updating addonConnected=true for source '%s'", sourceQuery)
 		a.addonStatusMux.Unlock()
 		// --- End Addon connection tracking ---
 
@@ -410,7 +510,7 @@ func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	} else {
 		// Log pings from unknown sources
-		log.Printf("DEBUG: healthHandler - Received ping from unknown source: %s", sourceQuery)
+		// log.Printf("DEBUG: healthHandler - Received ping from unknown source: %s", sourceQuery)
 	}
 
 	// Prepare status response
@@ -442,7 +542,7 @@ func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 
 // GetStatus returns the current status for the UI
 func (a *App) GetStatus() map[string]interface{} {
-	log.Println("DEBUG: Entered GetStatus")
+	// log.Println("DEBUG: Entered GetStatus")
 	a.queueMux.Lock()
 	// Read fields protected by queueMux
 	bridgeActive := a.bridgeActive

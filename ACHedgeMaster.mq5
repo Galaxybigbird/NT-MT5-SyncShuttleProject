@@ -1,5 +1,5 @@
 #property link      ""
-#property version   "1.85"
+#property version   "2.05"
 #property strict
 #property description "Hedge Receiver EA for Go bridge server with Asymmetrical Compounding"
 
@@ -82,6 +82,11 @@ string g_actions[];           // Array of trade actions
 bool g_isComplete[];          // Array of completion flags
 string g_ntInstrumentSymbols[]; // Array of NT instrument symbols
 string g_ntAccountNames[];    // Array of NT account names
+int g_mt5HedgesOpenedCount[]; // NEW: Count of MT5 hedges opened for this group
+int g_mt5HedgesClosedCount[]; // NEW: Count of MT5 hedges closed for this group
+bool g_isMT5Opened[];         // NEW: Flag if MT5 hedge has been opened for this group
+bool g_isMT5Closed[];         // NEW: Flag if all MT5 hedges for this group are closed
+
 CHashMap<long, CString*> *g_map_position_id_to_base_id = NULL; // Map PositionID (long) to original base_id (CString*)
 // CHashMap for PositionTradeDetails removed.
 // New parallel arrays for MT5 position details will be added here.
@@ -89,6 +94,14 @@ long g_open_mt5_pos_ids[];       // Stores MT5 Position IDs
 string g_open_mt5_base_ids[];    // Stores corresponding NT Base IDs
 string g_open_mt5_nt_symbols[];  // Stores corresponding NT Instrument Symbols
 string g_open_mt5_nt_accounts[]; // Stores corresponding NT Account Names
+string g_open_mt5_actions[];     // NEW: Stores the MT5 position type ("buy" or "sell") for open positions
+string g_open_mt5_original_nt_actions[];    // NEW: Stores original NT action for rehydrated open MT5 positions
+int    g_open_mt5_original_nt_quantities[]; // NEW: Stores original NT quantity for rehydrated open MT5 positions
+
+// Mutex-like mechanism to prevent concurrent array modifications
+bool g_array_modification_in_progress = false;
+datetime g_last_array_modification_time = 0;
+const int ARRAY_MODIFICATION_TIMEOUT_SECONDS = 30; // Maximum time to wait for array modification to complete
 
 // Function to find or create trade group
 int FindOrCreateTradeGroup(string baseId, int totalQty, string action)
@@ -136,71 +149,142 @@ int FindOrCreateTradeGroup(string baseId, int totalQty, string action)
 // Function to clean up completed trade groups
 void CleanupTradeGroups()
 {
+    Print("ACHM_DIAG: [CleanupTradeGroups] Starting cleanup. Current g_baseIds size: ", ArraySize(g_baseIds));
     int arraySize = ArraySize(g_baseIds);
     if(arraySize == 0) return;  // Nothing to clean up
-    
-    int activeCount = 0;
+
+    int keepCount = 0;
+    bool groupsToKeep[]; // Temp array to mark groups to keep
+    if(arraySize > 0) ArrayResize(groupsToKeep, arraySize); // Resize only if arraySize > 0
+
     for(int i = 0; i < arraySize; i++)
     {
-        if(!g_isComplete[i])
-            activeCount++;
+        bool nt_fills_complete = g_isComplete[i];
+        // Ensure index is valid for new arrays before accessing
+        bool mt5_hedges_opened_exist = (i < ArraySize(g_mt5HedgesOpenedCount) && g_mt5HedgesOpenedCount[i] > 0);
+        bool all_mt5_hedges_closed = (i < ArraySize(g_mt5HedgesClosedCount) && i < ArraySize(g_mt5HedgesOpenedCount) &&
+                                      g_mt5HedgesClosedCount[i] >= g_mt5HedgesOpenedCount[i]);
+
+        // A group is kept if:
+        // 1. NT fills are NOT YET complete OR
+        // 2. NT fills ARE complete, BUT (EITHER no MT5 hedges were ever opened for it OR (MT5 hedges were opened AND NOT ALL of them are closed yet)).
+        // Simplified: Keep if NT not complete, OR if NT is complete but MT5 side is not fully resolved.
+        if (!nt_fills_complete || (nt_fills_complete && mt5_hedges_opened_exist && !all_mt5_hedges_closed) ) {
+            groupsToKeep[i] = true;
+            keepCount++;
+            Print("ACHM_DIAG: [CleanupTradeGroups] KEEPING group with base_id: '", g_baseIds[i], "' at index ", i,
+                  ". NT_Complete: ", nt_fills_complete,
+                  ", MT5_Opened_Exist: ", mt5_hedges_opened_exist,
+                  ", MT5_All_Closed: ", all_mt5_hedges_closed,
+                  ", Opened: ", (i < ArraySize(g_mt5HedgesOpenedCount) ? (string)g_mt5HedgesOpenedCount[i] : "N/A"),
+                  ", Closed: ", (i < ArraySize(g_mt5HedgesClosedCount) ? (string)g_mt5HedgesClosedCount[i] : "N/A"));
+        } else {
+            groupsToKeep[i] = false; // Mark for removal
+            Print("ACHM_DIAG: [CleanupTradeGroups] Eligible for REMOVAL group with base_id: '", g_baseIds[i], "' at index ", i,
+                  ". NT_Complete: ", nt_fills_complete,
+                  ", MT5_Opened_Exist: ", mt5_hedges_opened_exist,
+                  ", MT5_All_Closed: ", all_mt5_hedges_closed,
+                  ", Opened: ", (i < ArraySize(g_mt5HedgesOpenedCount) ? (string)g_mt5HedgesOpenedCount[i] : "N/A"),
+                  ", Closed: ", (i < ArraySize(g_mt5HedgesClosedCount) ? (string)g_mt5HedgesClosedCount[i] : "N/A"));
+        }
     }
-    
-    if(activeCount < arraySize)
+
+    if(keepCount < arraySize) // If there are groups to remove
     {
         string tempBaseIds[];
         int tempTotalQty[];
         int tempProcessedQty[];
         string tempActions[];
         bool tempComplete[];
-        
-        if(activeCount > 0)
+        string tempNtSymbols[];
+        string tempNtAccounts[];
+        int tempMt5Opened[];
+        int tempMt5Closed[];
+        bool tempIsMT5Opened[];
+        bool tempIsMT5Closed[];
+
+        if(keepCount > 0)
         {
-            ArrayResize(tempBaseIds, activeCount);
-            ArrayResize(tempTotalQty, activeCount);
-            ArrayResize(tempProcessedQty, activeCount);
-            ArrayResize(tempActions, activeCount);
-            ArrayResize(tempComplete, activeCount);
-            
+            ArrayResize(tempBaseIds, keepCount);
+            ArrayResize(tempTotalQty, keepCount);
+            ArrayResize(tempProcessedQty, keepCount);
+            ArrayResize(tempActions, keepCount);
+            ArrayResize(tempComplete, keepCount);
+            ArrayResize(tempNtSymbols, keepCount);
+            ArrayResize(tempNtAccounts, keepCount);
+            ArrayResize(tempMt5Opened, keepCount);
+            ArrayResize(tempMt5Closed, keepCount);
+            ArrayResize(tempIsMT5Opened, keepCount);
+            ArrayResize(tempIsMT5Closed, keepCount);
+
             int newIndex = 0;
             for(int i = 0; i < arraySize; i++)
             {
-                if(!g_isComplete[i])
+                if(groupsToKeep[i]) // If marked to keep
                 {
                     tempBaseIds[newIndex] = g_baseIds[i];
                     tempTotalQty[newIndex] = g_totalQuantities[i];
                     tempProcessedQty[newIndex] = g_processedQuantities[i];
                     tempActions[newIndex] = g_actions[i];
                     tempComplete[newIndex] = g_isComplete[i];
+                    if (i < ArraySize(g_ntInstrumentSymbols)) tempNtSymbols[newIndex] = g_ntInstrumentSymbols[i]; else tempNtSymbols[newIndex] = "";
+                    if (i < ArraySize(g_ntAccountNames)) tempNtAccounts[newIndex] = g_ntAccountNames[i]; else tempNtAccounts[newIndex] = "";
+                    if (i < ArraySize(g_mt5HedgesOpenedCount)) tempMt5Opened[newIndex] = g_mt5HedgesOpenedCount[i]; else tempMt5Opened[newIndex] = 0;
+                    if (i < ArraySize(g_mt5HedgesClosedCount)) tempMt5Closed[newIndex] = g_mt5HedgesClosedCount[i]; else tempMt5Closed[newIndex] = 0;
+                    if (i < ArraySize(g_isMT5Opened)) tempIsMT5Opened[newIndex] = g_isMT5Opened[i]; else tempIsMT5Opened[newIndex] = false; // Default to false if out of bounds
+                    if (i < ArraySize(g_isMT5Closed)) tempIsMT5Closed[newIndex] = g_isMT5Closed[i]; else tempIsMT5Closed[newIndex] = false; // Default to false if out of bounds
                     newIndex++;
+                } else {
+                     // This log was already printed above when eligibility was determined
+                    // Print("ACHM_DIAG: [CleanupTradeGroups] Removing group with base_id: '", g_baseIds[i], "' at index ", i);
                 }
             }
         }
-        
+
         ArrayFree(g_baseIds);
         ArrayFree(g_totalQuantities);
         ArrayFree(g_processedQuantities);
         ArrayFree(g_actions);
         ArrayFree(g_isComplete);
-        
-        if(activeCount > 0)
+        ArrayFree(g_ntInstrumentSymbols);
+        ArrayFree(g_ntAccountNames);
+        ArrayFree(g_mt5HedgesOpenedCount);
+        ArrayFree(g_mt5HedgesClosedCount);
+        ArrayFree(g_isMT5Opened);
+        ArrayFree(g_isMT5Closed);
+
+        if(keepCount > 0)
         {
             ArrayCopy(g_baseIds, tempBaseIds);
             ArrayCopy(g_totalQuantities, tempTotalQty);
             ArrayCopy(g_processedQuantities, tempProcessedQty);
             ArrayCopy(g_actions, tempActions);
             ArrayCopy(g_isComplete, tempComplete);
+            ArrayCopy(g_ntInstrumentSymbols, tempNtSymbols);
+            ArrayCopy(g_ntAccountNames, tempNtAccounts);
+            ArrayCopy(g_mt5HedgesOpenedCount, tempMt5Opened);
+            ArrayCopy(g_mt5HedgesClosedCount, tempMt5Closed);
+            ArrayCopy(g_isMT5Opened, tempIsMT5Opened);
+            ArrayCopy(g_isMT5Closed, tempIsMT5Closed);
         }
-        else
+        else // No groups to keep, so resize all to 0
         {
-            // If no active trades, initialize arrays with size 0
             ArrayResize(g_baseIds, 0);
             ArrayResize(g_totalQuantities, 0);
             ArrayResize(g_processedQuantities, 0);
             ArrayResize(g_actions, 0);
             ArrayResize(g_isComplete, 0);
+            ArrayResize(g_ntInstrumentSymbols, 0);
+            ArrayResize(g_ntAccountNames, 0);
+            ArrayResize(g_mt5HedgesOpenedCount, 0);
+            ArrayResize(g_mt5HedgesClosedCount, 0);
+            ArrayResize(g_isMT5Opened, 0);
+            ArrayResize(g_isMT5Closed, 0);
         }
+    } else {
+         Print("ACHM_DIAG: [CleanupTradeGroups] No groups eligible for removal based on new criteria. Current count: ", arraySize);
     }
+    if(arraySize > 0) ArrayFree(groupsToKeep); // Free the temporary boolean array
 }
 
 // Add this new function after CleanupTradeGroups()
@@ -215,9 +299,142 @@ void ResetTradeGroups()
     ArrayResize(g_isComplete, 0);
     ArrayResize(g_ntInstrumentSymbols, 0); // Initialize new array
     ArrayResize(g_ntAccountNames, 0);    // Initialize new array
+    ArrayResize(g_mt5HedgesOpenedCount, 0); // NEW: Reset MT5 opened hedges count array
+    ArrayResize(g_mt5HedgesClosedCount, 0); // NEW: Reset MT5 closed hedges count array
+    ArrayResize(g_isMT5Opened, 0);          // NEW: Reset MT5 opened flag array
+    ArrayResize(g_isMT5Closed, 0);          // NEW: Reset MT5 closed flag array
     globalFutures = 0.0;  // Reset global futures counter
-    g_highWaterEOD  = 0.0;      // <<< NEW – restart trailing‑dd calc
-    Print("DEBUG: Trade groups reset complete. Global futures: ", globalFutures);
+    g_highWaterEOD  = 0.0;      // <<< NEW – restart trailing‑dd calc
+    Print("ACHM_DIAG: [ResetTradeGroups] Trade groups reset complete. Global futures: ", globalFutures);
+}
+
+//+------------------------------------------------------------------+
+//| Removes a specific trade group by index from all tracking arrays |
+//+------------------------------------------------------------------+
+void FinalizeAndRemoveTradeGroup(int remove_idx)
+{
+    int arraySize = ArraySize(g_baseIds);
+    if(remove_idx < 0 || remove_idx >= arraySize)
+    {
+        Print("ACHM_ERROR: [FinalizeAndRemoveTradeGroup] Invalid index ", remove_idx, " for removal. Array size: ", arraySize);
+        return;
+    }
+
+    Print("ACHM_LOG: [FinalizeAndRemoveTradeGroup] Removing trade group at index ", remove_idx, " with base_id: '", (remove_idx < ArraySize(g_baseIds) ? g_baseIds[remove_idx] : "N/A_OOB"), "'. Current array size: ", arraySize);
+
+    // Create temporary arrays for all but the element to remove
+    int newSize = arraySize - 1;
+    if (newSize < 0) newSize = 0;
+
+    string tempBaseIds[];
+    int    tempTotalQuantities[];
+    int    tempProcessedQuantities[];
+    string tempActions[];
+    bool   tempIsComplete[];
+    string tempNtInstrumentSymbols[];
+    string tempNtAccountNames[];
+    int    tempMt5HedgesOpenedCount[];
+    int    tempMt5HedgesClosedCount[];
+    bool   tempIsMT5Opened[];
+    bool   tempIsMT5Closed[];
+
+    if (newSize > 0)
+    {
+        ArrayResize(tempBaseIds, newSize);
+        ArrayResize(tempTotalQuantities, newSize);
+        ArrayResize(tempProcessedQuantities, newSize);
+        ArrayResize(tempActions, newSize);
+        ArrayResize(tempIsComplete, newSize);
+        ArrayResize(tempNtInstrumentSymbols, newSize);
+        ArrayResize(tempNtAccountNames, newSize);
+        ArrayResize(tempMt5HedgesOpenedCount, newSize);
+        ArrayResize(tempMt5HedgesClosedCount, newSize);
+        ArrayResize(tempIsMT5Opened, newSize);
+        ArrayResize(tempIsMT5Closed, newSize);
+    }
+
+    int current_temp_idx = 0;
+    for(int i = 0; i < arraySize; i++)
+    {
+        if(i == remove_idx)
+        {
+            // Skip the element to be removed
+            continue;
+        }
+        if (current_temp_idx < newSize) // Boundary check for temp arrays
+        {
+            if (i < ArraySize(g_baseIds)) tempBaseIds[current_temp_idx] = g_baseIds[i]; else tempBaseIds[current_temp_idx] = "";
+            if (i < ArraySize(g_totalQuantities)) tempTotalQuantities[current_temp_idx] = g_totalQuantities[i]; else tempTotalQuantities[current_temp_idx] = 0;
+            if (i < ArraySize(g_processedQuantities)) tempProcessedQuantities[current_temp_idx] = g_processedQuantities[i]; else tempProcessedQuantities[current_temp_idx] = 0;
+            if (i < ArraySize(g_actions)) tempActions[current_temp_idx] = g_actions[i]; else tempActions[current_temp_idx] = "";
+            if (i < ArraySize(g_isComplete)) tempIsComplete[current_temp_idx] = g_isComplete[i]; else tempIsComplete[current_temp_idx] = false;
+            if (i < ArraySize(g_ntInstrumentSymbols)) tempNtInstrumentSymbols[current_temp_idx] = g_ntInstrumentSymbols[i]; else tempNtInstrumentSymbols[current_temp_idx] = "";
+            if (i < ArraySize(g_ntAccountNames)) tempNtAccountNames[current_temp_idx] = g_ntAccountNames[i]; else tempNtAccountNames[current_temp_idx] = "";
+            if (i < ArraySize(g_mt5HedgesOpenedCount)) tempMt5HedgesOpenedCount[current_temp_idx] = g_mt5HedgesOpenedCount[i]; else tempMt5HedgesOpenedCount[current_temp_idx] = 0;
+            if (i < ArraySize(g_mt5HedgesClosedCount)) tempMt5HedgesClosedCount[current_temp_idx] = g_mt5HedgesClosedCount[i]; else tempMt5HedgesClosedCount[current_temp_idx] = 0;
+            if (i < ArraySize(g_isMT5Opened)) tempIsMT5Opened[current_temp_idx] = g_isMT5Opened[i]; else tempIsMT5Opened[current_temp_idx] = false;
+            if (i < ArraySize(g_isMT5Closed)) tempIsMT5Closed[current_temp_idx] = g_isMT5Closed[i]; else tempIsMT5Closed[current_temp_idx] = false;
+            current_temp_idx++;
+        } else if (newSize > 0) {
+             Print("ACHM_ERROR: [FinalizeAndRemoveTradeGroup] current_temp_idx ", current_temp_idx, " exceeded newSize ", newSize, " during copy.");
+        }
+    }
+
+    // Free old arrays
+    ArrayFree(g_baseIds);
+    ArrayFree(g_totalQuantities);
+    ArrayFree(g_processedQuantities);
+    ArrayFree(g_actions);
+    ArrayFree(g_isComplete);
+    ArrayFree(g_ntInstrumentSymbols);
+    ArrayFree(g_ntAccountNames);
+    ArrayFree(g_mt5HedgesOpenedCount);
+    ArrayFree(g_mt5HedgesClosedCount);
+    ArrayFree(g_isMT5Opened);
+    ArrayFree(g_isMT5Closed);
+
+    // Copy from temp arrays or resize to 0 if newSize is 0
+    if (newSize > 0)
+    {
+        ArrayCopy(g_baseIds, tempBaseIds);
+        ArrayCopy(g_totalQuantities, tempTotalQuantities);
+        ArrayCopy(g_processedQuantities, tempProcessedQuantities);
+        ArrayCopy(g_actions, tempActions);
+        ArrayCopy(g_isComplete, tempIsComplete);
+        ArrayCopy(g_ntInstrumentSymbols, tempNtInstrumentSymbols);
+        ArrayCopy(g_ntAccountNames, tempNtAccountNames);
+        ArrayCopy(g_mt5HedgesOpenedCount, tempMt5HedgesOpenedCount);
+        ArrayCopy(g_mt5HedgesClosedCount, tempMt5HedgesClosedCount);
+        ArrayCopy(g_isMT5Opened, tempIsMT5Opened);
+        ArrayCopy(g_isMT5Closed, tempIsMT5Closed);
+
+        ArrayFree(tempBaseIds);
+        ArrayFree(tempTotalQuantities);
+        ArrayFree(tempProcessedQuantities);
+        ArrayFree(tempActions);
+        ArrayFree(tempIsComplete);
+        ArrayFree(tempNtInstrumentSymbols);
+        ArrayFree(tempNtAccountNames);
+        ArrayFree(tempMt5HedgesOpenedCount);
+        ArrayFree(tempMt5HedgesClosedCount);
+        ArrayFree(tempIsMT5Opened);
+        ArrayFree(tempIsMT5Closed);
+    }
+    else
+    {
+        ArrayResize(g_baseIds, 0);
+        ArrayResize(g_totalQuantities, 0);
+        ArrayResize(g_processedQuantities, 0);
+        ArrayResize(g_actions, 0);
+        ArrayResize(g_isComplete, 0);
+        ArrayResize(g_ntInstrumentSymbols, 0);
+        ArrayResize(g_ntAccountNames, 0);
+        ArrayResize(g_mt5HedgesOpenedCount, 0);
+        ArrayResize(g_mt5HedgesClosedCount, 0);
+        ArrayResize(g_isMT5Opened, 0);
+        ArrayResize(g_isMT5Closed, 0);
+    }
+    Print("ACHM_LOG: [FinalizeAndRemoveTradeGroup] Trade group removal complete. New array size: ", ArraySize(g_baseIds));
 }
 
 //+------------------------------------------------------------------+
@@ -245,11 +462,13 @@ void SendHedgeCloseNotification(string base_id,
                                 string nt_account_name,
                                 double closed_hedge_quantity,
                                 string closed_hedge_action,
-                                datetime timestamp_dt) // Expects datetime
+                                datetime timestamp_dt, // Expects datetime
+                                string closure_reason) // NEW: Reason for closure
 {
     string timestamp_str = FormatUTCTimestamp(timestamp_dt); // Format internally
 
     string payload = "{";
+    payload += "\"event_type\":\"hedge_close_notification\","; // Moved event_type up for clarity
     payload += "\"base_id\":\"" + base_id + "\",";
     payload += "\"nt_instrument_symbol\":\"" + nt_instrument_symbol + "\",";
     payload += "\"nt_account_name\":\"" + nt_account_name + "\",";
@@ -259,7 +478,7 @@ void SendHedgeCloseNotification(string base_id,
     payload += "\"closed_hedge_quantity\":" + DoubleToString(closed_hedge_quantity, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)) + ",";
     payload += "\"closed_hedge_action\":\"" + closed_hedge_action + "\",";
     payload += "\"timestamp\":\"" + timestamp_str + "\",";
-    payload += "\"event_type\":\"hedge_close_notification\"";
+    payload += "\"closure_reason\":\"" + closure_reason + "\""; // Added closure_reason
     payload += "}";
 
     string url = BridgeURL + "/notify_hedge_close";
@@ -702,9 +921,12 @@ int OnInit()
    // Initialize new global arrays for NT instrument and account names
    ArrayResize(g_ntInstrumentSymbols, 0);
    ArrayResize(g_ntAccountNames, 0);
-   
+   // Also initialize new g_open_mt5_ parallel arrays
+   ArrayResize(g_open_mt5_original_nt_actions, 0);
+   ArrayResize(g_open_mt5_original_nt_quantities, 0);
+
    // Initialize the asymmetrical compounding risk management (reads inputs from ACFunctions.mqh)
-   InitializeACRiskManagement();
+   InitializeACRiskManagement(); // This also initializes currentRisk, etc.
    trade.SetExpertMagicNumber(MagicNumber); // Set MagicNumber for CTrade
    // Note: ATR settings (ATRPeriod, ATRMultiplier, MaxStopLossDistance) are also initialized within ACFunctions.mqh or ATRTrailing.mqh
    
@@ -749,37 +971,182 @@ int OnInit()
    else // health_check_result >= 0
    {
       // Success: WebRequest returned a non-negative code.
-      // No need to check response body for a simple health ping.
       Print("=================================");
       Print("✓ Bridge server connection test passed (Status Code: ", health_check_result, ")");
       g_bridgeConnected = true;
       g_loggedDisconnect = false; // Ensure logged flag is reset on success
       UpdateStatusIndicator("Connected", clrGreen); // Update indicator
    }
+
+   // --- STATE RECOVERY LOGIC ---
+   Print("ACHM_RECOVERY: Starting state recovery for existing MT5 positions...");
+   int total_positions = PositionsTotal();
+   int rehydrated_count = 0;
+   double recovered_global_futures_adjustment = 0.0;
+
+   for(int i = 0; i < total_positions; i++) {
+       ulong mt5_ticket = PositionGetTicket(i);
+       if(mt5_ticket == 0) continue;
+       if(!PositionSelectByTicket(mt5_ticket)) continue;
+
+       if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol) {
+           string comment = PositionGetString(POSITION_COMMENT);
+           long mt5_pos_id = (long)PositionGetInteger(POSITION_IDENTIFIER); // Same as mt5_ticket for MT5 positions
+           ENUM_POSITION_TYPE mt5_pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+           double mt5_pos_volume = PositionGetDouble(POSITION_VOLUME);
+
+           Print("ACHM_RECOVERY: Checking EA position. Ticket: ", mt5_ticket, ", Comment: '", comment, "', Type: ", EnumToString(mt5_pos_type), ", Vol: ", mt5_pos_volume);
+
+           // Parse comment: "AC_HEDGE;BID:{base_id};NTA:{NT_ACTION};NTQ:{NT_QTY};MTA:{MT5_ACTION}"
+           string base_id_str = ExtractBaseIdFromComment(comment);
+
+           if (base_id_str != "") {
+               Print("ACHM_RECOVERY: Extracted BaseID='", base_id_str, "' from comment '", comment, "' for PosID ", mt5_pos_id);
+
+               // 1. Re-populate g_map_position_id_to_base_id (Primary Goal)
+               if(CheckPointer(g_map_position_id_to_base_id) == POINTER_DYNAMIC) {
+                   CString *s_base_id_obj = new CString();
+                   s_base_id_obj.Assign(base_id_str);
+                   if(!g_map_position_id_to_base_id.Add(mt5_pos_id, s_base_id_obj)) {
+                       Print("ACHM_RECOVERY_ERROR: Failed to add to g_map_position_id_to_base_id for PosID ", mt5_pos_id, " with base_id '", base_id_str, "'");
+                       delete s_base_id_obj;
+                   } else {
+                        Print("ACHM_RECOVERY: Re-mapped g_map_position_id_to_base_id: MT5 PosID ", mt5_pos_id, " -> base_id '", base_id_str, "'");
+                   }
+               }
+
+               // Attempt to parse other parts for more complete rehydration
+               string nt_action_str = "";
+               int nt_qty_val = 0;
+               string mt5_action_str = ""; // This is the MT5 hedge's action (Buy/Sell)
+
+               string parts[];
+               int num_parts = StringSplit(comment, ';', parts);
+
+               if (num_parts > 0 && parts[0] == "AC_HEDGE") {
+                   // NTA:{NT_ACTION} - Original NT Action (parts[2])
+                   if (num_parts > 2 && StringFind(parts[2], "NTA:", 0) == 0) {
+                       string nta_part[]; StringSplit(parts[2], ':', nta_part);
+                       if(ArraySize(nta_part) == 2) nt_action_str = nta_part[1];
+                   }
+                   // NTQ:{NT_QTY} - Original NT Quantity (parts[3])
+                   if (num_parts > 3 && StringFind(parts[3], "NTQ:", 0) == 0) {
+                       string ntq_part[]; StringSplit(parts[3], ':', ntq_part);
+                       if(ArraySize(ntq_part) == 2) nt_qty_val = (int)StringToInteger(ntq_part[1]);
+                   }
+                   // MTA:{MT5_ACTION} - MT5 Hedge Action (parts[4])
+                   if (num_parts > 4 && StringFind(parts[4], "MTA:", 0) == 0) {
+                       string mta_part[]; StringSplit(parts[4], ':', mta_part);
+                       if(ArraySize(mta_part) == 2) mt5_action_str = mta_part[1];
+                   }
+                   Print("ACHM_RECOVERY: Attempted parsing NTA/NTQ/MTA from '", comment, "': NT_Action='", nt_action_str, "', NT_Qty=", nt_qty_val, ", MT5_Action='", mt5_action_str, "'");
+               } else {
+                   Print("ACHM_RECOVERY_INFO: Comment '", comment, "' for PosID ", mt5_pos_id, " did not start with AC_HEDGE or was too short for full NTA/NTQ/MTA parsing after splitting by ';'. BaseID '", base_id_str, "' was still extracted.");
+               }
+
+               // Proceed with full rehydration if all essential parts were parsed
+               if(nt_action_str != "" && nt_qty_val > 0 && mt5_action_str != "") {
+                   Print("ACHM_RECOVERY: All parts parsed for full rehydration. Ticket ", mt5_ticket, ": BaseID='", base_id_str, "', NT_Action='", nt_action_str, "', NT_Qty=", nt_qty_val, ", MT5_Action='", mt5_action_str, "'");
+
+                   // 2. Re-create Trade Group Entry
+                   int group_idx = -1;
+                   for(int k=0; k < ArraySize(g_baseIds); k++) {
+                       if(g_baseIds[k] == base_id_str) {
+                           group_idx = k;
+                           Print("ACHM_RECOVERY: Found existing (potentially incomplete) trade group for base_id '", base_id_str, "' at index ", group_idx);
+                           break;
+                       }
+                   }
+                   if(group_idx == -1) { // Create new if not found
+                       group_idx = ArraySize(g_baseIds);
+                       ArrayResize(g_baseIds, group_idx + 1);
+                       ArrayResize(g_totalQuantities, group_idx + 1);
+                       ArrayResize(g_processedQuantities, group_idx + 1);
+                       ArrayResize(g_actions, group_idx + 1);
+                       ArrayResize(g_isComplete, group_idx + 1);
+                       ArrayResize(g_ntInstrumentSymbols, group_idx + 1);
+                       ArrayResize(g_ntAccountNames, group_idx + 1);
+                       ArrayResize(g_mt5HedgesOpenedCount, group_idx + 1);
+                       ArrayResize(g_mt5HedgesClosedCount, group_idx + 1);
+                       ArrayResize(g_isMT5Opened, group_idx + 1);
+                       ArrayResize(g_isMT5Closed, group_idx + 1);
+                       Print("ACHM_RECOVERY: Creating new trade group for rehydrated base_id '", base_id_str, "' at index ", group_idx);
+                   }
+
+                   g_baseIds[group_idx] = base_id_str;
+                   g_actions[group_idx] = nt_action_str;
+                   g_totalQuantities[group_idx] = nt_qty_val;
+                   g_processedQuantities[group_idx] = nt_qty_val;
+                   g_isComplete[group_idx] = true;
+                   
+                   g_mt5HedgesOpenedCount[group_idx] = 1;
+                   g_mt5HedgesClosedCount[group_idx] = 0;
+                   g_isMT5Opened[group_idx] = true;
+                   g_isMT5Closed[group_idx] = false;
+                   
+                   g_ntInstrumentSymbols[group_idx] = PositionGetString(POSITION_SYMBOL);
+                   g_ntAccountNames[group_idx] = AccountInfoString(ACCOUNT_NAME);
+
+                   // 3. Re-populate g_open_mt5_pos_ids and parallel arrays
+                   int open_mt5_idx = ArraySize(g_open_mt5_pos_ids);
+                   ArrayResize(g_open_mt5_pos_ids, open_mt5_idx + 1);
+                   ArrayResize(g_open_mt5_base_ids, open_mt5_idx + 1);
+                   ArrayResize(g_open_mt5_nt_symbols, open_mt5_idx + 1);
+                   ArrayResize(g_open_mt5_nt_accounts, open_mt5_idx + 1);
+                   ArrayResize(g_open_mt5_original_nt_actions, open_mt5_idx + 1);
+                   ArrayResize(g_open_mt5_original_nt_quantities, open_mt5_idx + 1);
+                   ArrayResize(g_open_mt5_actions, open_mt5_idx + 1); // <<< ADDED FOR MT5 ACTION RECOVERY
+
+                   g_open_mt5_pos_ids[open_mt5_idx] = mt5_pos_id;
+                   g_open_mt5_base_ids[open_mt5_idx] = base_id_str;
+                   g_open_mt5_nt_symbols[open_mt5_idx] = PositionGetString(POSITION_SYMBOL);
+                   g_open_mt5_nt_accounts[open_mt5_idx] = AccountInfoString(ACCOUNT_NAME);
+                   g_open_mt5_original_nt_actions[open_mt5_idx] = nt_action_str;
+                   g_open_mt5_original_nt_quantities[open_mt5_idx] = nt_qty_val;
+                   g_open_mt5_actions[open_mt5_idx] = mt5_action_str; // <<< ADDED FOR MT5 ACTION RECOVERY
+                   Print("ACHM_RECOVERY: Added to g_open_mt5_ arrays. PosID:", mt5_pos_id, " BaseID:", base_id_str, " NT_Action:'", nt_action_str, "', NT_Qty:", nt_qty_val, ", MT5_Action:'", mt5_action_str, "'"); // <<< UPDATED LOG
+
+                   // 4. Adjust globalFutures
+                   if (mt5_pos_type == POSITION_TYPE_BUY) {
+                       recovered_global_futures_adjustment -= nt_qty_val;
+                       Print("ACHM_RECOVERY: MT5 BUY hedge (for NT SELL) rehydrated. Adjusting globalFutures by -", nt_qty_val);
+                   } else if (mt5_pos_type == POSITION_TYPE_SELL) {
+                       recovered_global_futures_adjustment += nt_qty_val;
+                       Print("ACHM_RECOVERY: MT5 SELL hedge (for NT BUY) rehydrated. Adjusting globalFutures by +", nt_qty_val);
+                   }
+                   rehydrated_count++;
+                   Print("ACHM_RECOVERY: Successfully rehydrated state for MT5 PositionID ", mt5_pos_id, " (Ticket: ", mt5_ticket, ")");
+               } else {
+                   Print("ACHM_RECOVERY_WARN: Base_id '", base_id_str, "' extracted, but other parts (NTA/NTQ/MTA) for full rehydration are missing/invalid from comment '", comment, "'. PosID ", mt5_pos_id, " was mapped, but group/globalFutures rehydration might be incomplete for this specific position.");
+               }
+           } else { // base_id_str is empty
+               Print("ACHM_RECOVERY_FAIL: Failed to extract a valid base_id from comment '", comment, "' for position ticket ", mt5_ticket, ". Cannot rehydrate this position's state.");
+           }
+       }
+   }
+   globalFutures += recovered_global_futures_adjustment; // Apply the total adjustment
+   Print("ACHM_RECOVERY: State recovery complete. Rehydrated ", rehydrated_count, " positions. Total adjustment to globalFutures: ", recovered_global_futures_adjustment, ". New globalFutures: ", globalFutures);
+   // --- END STATE RECOVERY LOGIC ---
    
    Print("=================================");
    Print("✓ HedgeReceiver EA initialized successfully");
    Print("✓ Connected to bridge server at: ", BridgeURL);
-   if(UseACRiskManagement) // Use variable from ACFunctions.mqh
+   if(UseACRiskManagement)
       Print("✓ Asymmetrical Compounding enabled with base risk: ", AC_BaseRisk, "%");
    Print("✓ Monitoring for trades...");
    Print("=================================");
    
-   // Initialize DEMA-ATR for trailing stop functionality
    if(UseATRTrailing)
    {
       InitDEMAATR();
       Print("✓ DEMA-ATR trailing stop initialized");
    }
    
-   // Initialize status indicator
    InitStatusIndicator();
    Print("✓ Status indicator initialized");
    
-   // Set up timer for periodic tasks (trade checks and health pings) - every 1 second
-   // EventSetTimer(1); // Triggers OnTimer every second
-   EventSetMillisecondTimer(200); // Triggers OnTimer every 200 milliseconds
-   g_timerCounter = 0; // Initialize timer counter
+   EventSetMillisecondTimer(200);
+   g_timerCounter = 0;
    
    return(INIT_SUCCEEDED);
 }
@@ -1125,6 +1492,15 @@ void OnTimer()
 {
    g_timerCounter++; // Increment counter each second
 
+   // --- Periodic Array Integrity Check (every 30 seconds) ---
+   if(g_timerCounter % 30 == 0)
+   {
+      if(!ValidateArrayIntegrity(true)) {
+         PrintFormat("CRITICAL_ARRAY_CORRUPTION: Array integrity check failed in OnTimer at counter %d", g_timerCounter);
+         PrintFormat("CRITICAL_ARRAY_CORRUPTION: This indicates the array corruption bug may still be present or has occurred.");
+      }
+   }
+
    // --- Periodic Health Ping (e.g., every 15 seconds) ---
    if(g_timerCounter % 15 == 0)
    {
@@ -1223,177 +1599,239 @@ void OnTimer()
        }
    }
    
-   // Store globalFutures before this specific NT trade's impact
-   double globalFuturesBeforeNtTrade = globalFutures;
-   Print("ACHM_LOG: [OnTimer] Processing NT trade. Base_ID='", baseIdFromJson, "', Action='", incomingNtAction, "', Qty=", incomingNtQuantity, ", TotalQtyForBaseID=", totalQtyForBaseId, ". globalFutures BEFORE this trade: ", globalFuturesBeforeNtTrade);
+   Print("ACHM_LOG: [OnTimer] Processing NT message. Base_ID='", baseIdFromJson, "', Action='", incomingNtAction, "', Qty=", incomingNtQuantity, ", TotalQtyForBaseID=", totalQtyForBaseId, ", NT_Inst='", ntInstrument, "', NT_Acc='", ntAccount, "'");
 
-   // Update globalFutures based on THIS incoming NT trade's action and quantity
-   if(incomingNtAction == "Buy" || incomingNtAction == "BuyToCover") {
-       globalFutures += incomingNtQuantity;
-   } else if(incomingNtAction == "Sell" || incomingNtAction == "SellShort") {
-       globalFutures -= incomingNtQuantity;
-   }
-   Print("ACHM_LOG: [OnTimer] globalFutures AFTER this trade: ", globalFutures);
-
-   // Determine if this NT trade was a reducing trade
-   bool isReducingNtTrade = false;
-   if ((incomingNtAction == "Buy" || incomingNtAction == "BuyToCover") && globalFuturesBeforeNtTrade < 0 && globalFutures > globalFuturesBeforeNtTrade) {
-       isReducingNtTrade = true;
-       Print("ACHM_LOG: [OnTimer] NT trade '", baseIdFromJson, "' is REDUCING (Buy reducing short).");
-   } else if ((incomingNtAction == "Sell" || incomingNtAction == "SellShort") && globalFuturesBeforeNtTrade > 0 && globalFutures < globalFuturesBeforeNtTrade) {
-       isReducingNtTrade = true;
-       Print("ACHM_LOG: [OnTimer] NT trade '", baseIdFromJson, "' is REDUCING (Sell reducing long).");
-   } else if (globalFutures != 0 && globalFuturesBeforeNtTrade != 0 && MathAbs(globalFutures) < MathAbs(globalFuturesBeforeNtTrade)) {
-        isReducingNtTrade = true;
-        Print("ACHM_LOG: [OnTimer] NT trade '", baseIdFromJson, "' is REDUCING (magnitude reduced towards zero).");
-   } else if (globalFutures == 0 && globalFuturesBeforeNtTrade != 0) {
-       isReducingNtTrade = true; // Explicitly mark as reducing if it brings futures to zero
-       Print("ACHM_LOG: [OnTimer] NT trade '", baseIdFromJson, "' is REDUCING (brought globalFutures to zero).");
-   }
-   
-   bool signFlipped = (globalFuturesBeforeNtTrade > 0 && globalFutures < 0) || (globalFuturesBeforeNtTrade < 0 && globalFutures > 0);
-   if (signFlipped) {
-       Print("ACHM_LOG: [OnTimer] NT trade '", baseIdFromJson, "' FLIPPED globalFutures sign. From ", globalFuturesBeforeNtTrade, " to ", globalFutures);
-   }
-   
-   // If globalFutures is now zero, close all hedges and reset.
-   if(globalFutures == 0.0)
-   {
-       Print("ACHM_LOG: [OnTimer] globalFutures is zero. Closing all hedge orders.");
-       CloseAllHedgeOrders();
-       if (PositionsTotal() == 0 && ArraySize(g_baseIds) == 0) {
-            Print("ACHM_LOG: [OnTimer] All positions closed and trade groups reset. Exiting OnTimer cycle.");
-            return;
-       } else {
-            Print("ACHM_LOG: [OnTimer] globalFutures is zero, CloseAllHedgeOrders called, but positions/groups might remain. Proceeding to CleanupTradeGroups.");
-       }
-       CleanupTradeGroups();
-       return;
-   }
-
-   // --- Overall Hedge Adjustment Logic ---
-   int desiredNetBuyHedges = 0;
-   int desiredNetSellHedges = 0;
-
-   if (globalFutures > 0) { // NT is Net Long
-       if (EnableHedging) { // MT5 should be Net Short
-           desiredNetSellHedges = (int)MathRound(MathAbs(globalFutures)); // Round to nearest int
-       } else { // MT5 copies NT, should be Net Long
-           desiredNetBuyHedges = (int)MathRound(MathAbs(globalFutures));
-       }
-   } else if (globalFutures < 0) { // NT is Net Short
-       if (EnableHedging) { // MT5 should be Net Long
-           desiredNetBuyHedges = (int)MathRound(MathAbs(globalFutures));
-       } else { // MT5 copies NT, should be Net Short
-           desiredNetSellHedges = (int)MathRound(MathAbs(globalFutures));
+   // --- Partial Fill Aggregation Logic ---
+   int groupIndex = -1;
+   // Try to find an existing, active (not yet complete for hedging) group for this base_id
+   for(int i = 0; i < ArraySize(g_baseIds); i++) {
+       if(g_baseIds[i] == baseIdFromJson && !g_isComplete[i]) { // g_isComplete now tracks if hedging action was taken for full order
+           groupIndex = i;
+           Print("ACHM_LOG: [PartialFill] Found existing active group for base_id '", baseIdFromJson, "' at index ", i, ". Processed: ", g_processedQuantities[i], ", Expected: ", g_totalQuantities[i]);
+           // Potentially update g_totalQuantities[i] if totalQtyForBaseId from this message is different and more up-to-date?
+           // For now, assume totalQtyForBaseId from first message is authoritative for the group.
+           break;
        }
    }
-   Print("ACHM_LOG: [HedgeAdjust] Desired Hedges: Buy=", desiredNetBuyHedges, ", Sell=", desiredNetSellHedges, " (Based on globalFutures=", globalFutures, ", EnableHedging=", EnableHedging, ")");
 
-   int currentMt5BuyPositions = 0;
-   int currentMt5SellPositions = 0;
-   for(int i = 0; i < PositionsTotal(); i++) {
-       if(PositionSelectByTicket(PositionGetTicket(i))) {
-           if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
-               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
-                   currentMt5BuyPositions++;
-               } else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) {
-                   currentMt5SellPositions++;
+   if(groupIndex == -1) {
+       // If no active group, check if this base_id was already completed and processed to avoid duplicate full processing.
+       for(int i = 0; i < ArraySize(g_baseIds); i++) {
+           if(g_baseIds[i] == baseIdFromJson && g_isComplete[i]) {
+                Print("ACHM_WARN: [PartialFill] Received message for already COMPLETED and PROCESSED base_id '", baseIdFromJson, "'. Qty: ", incomingNtQuantity, ". Ignoring for globalFutures/hedge update.");
+                CleanupTradeGroups(); // Still run cleanup
+                return;
+           }
+       }
+       // If truly new or a previous instance was fully cleaned up.
+       groupIndex = ArraySize(g_baseIds);
+       ArrayResize(g_baseIds, groupIndex + 1);
+       ArrayResize(g_totalQuantities, groupIndex + 1);
+       ArrayResize(g_processedQuantities, groupIndex + 1);
+       ArrayResize(g_actions, groupIndex + 1);
+       ArrayResize(g_isComplete, groupIndex + 1); // This flag now means "hedging action taken for full order"
+       ArrayResize(g_ntInstrumentSymbols, groupIndex + 1);
+       ArrayResize(g_ntAccountNames, groupIndex + 1);
+       ArrayResize(g_mt5HedgesOpenedCount, groupIndex + 1);
+       ArrayResize(g_mt5HedgesClosedCount, groupIndex + 1);
+       ArrayResize(g_isMT5Opened, groupIndex + 1);
+       ArrayResize(g_isMT5Closed, groupIndex + 1);
+
+       g_baseIds[groupIndex] = baseIdFromJson;
+       g_totalQuantities[groupIndex] = totalQtyForBaseId; // Expected total for this base_id
+       g_processedQuantities[groupIndex] = 0;             // Initialize processed quantity
+       g_actions[groupIndex] = incomingNtAction;          // Action from the first fill determines overall order action
+       g_isComplete[groupIndex] = false;                  // Not yet processed for full hedging
+       g_ntInstrumentSymbols[groupIndex] = ntInstrument;
+       g_ntAccountNames[groupIndex] = ntAccount;
+       g_mt5HedgesOpenedCount[groupIndex] = 0;
+       g_mt5HedgesClosedCount[groupIndex] = 0;
+       g_isMT5Opened[groupIndex] = false;
+       g_isMT5Closed[groupIndex] = false;
+       Print("ACHM_LOG: [PartialFill] Created NEW group for base_id '", baseIdFromJson, "' at index ", groupIndex, ". Expected TotalQty: ", totalQtyForBaseId, ", Action: ", incomingNtAction);
+   }
+
+   // If group was found/created and is not yet marked as fully processed for hedging
+   if (groupIndex != -1 && !g_isComplete[groupIndex]) {
+       g_processedQuantities[groupIndex] += (int)incomingNtQuantity;
+       Print("ACHM_LOG: [PartialFill] Updated processed qty for group '", g_baseIds[groupIndex], "' by ", (int)incomingNtQuantity,
+             ". New processed: ", g_processedQuantities[groupIndex], ", Expected Total: ", g_totalQuantities[groupIndex]);
+
+       // Check if all parts of the order for this base_id have been received
+       if (g_processedQuantities[groupIndex] >= g_totalQuantities[groupIndex]) {
+           // Ensure total processed doesn't exceed expected due to any bridge message issues.
+           if (g_processedQuantities[groupIndex] > g_totalQuantities[groupIndex]) {
+               Print("ACHM_WARN: [PartialFill] Processed quantity (", g_processedQuantities[groupIndex], ") for base_id '", g_baseIds[groupIndex],
+                     "' exceeds expected total (", g_totalQuantities[groupIndex], "). Clamping to expected total for hedge calculation.");
+               // g_processedQuantities[groupIndex] = g_totalQuantities[groupIndex]; // Or use g_totalQuantities directly for update
+           }
+           
+           g_isComplete[groupIndex] = true; // Mark as "hedging action to be taken / has been taken"
+           Print("ACHM_LOG: [PartialFill] Order for base_id '", g_baseIds[groupIndex], "' is now COMPLETE. Processed: ", g_processedQuantities[groupIndex], ", Total: ", g_totalQuantities[groupIndex]);
+           Print("ACHM_DIAG: [PartialFill] Triggering globalFutures update and hedge adjustment for COMPLETED base_id '", g_baseIds[groupIndex], "'");
+
+           double globalFuturesBeforeNtOrder = globalFutures;
+           double totalOrderQuantityForUpdate = g_totalQuantities[groupIndex]; // Use the definitive total for the order
+           string orderActionForUpdate = g_actions[groupIndex]; // Use action from the group
+
+           Print("ACHM_LOG: [OnTimerPF] Processing COMPLETED NT order. Base_ID='", g_baseIds[groupIndex], "', Action='", orderActionForUpdate, "', TotalOrderQty=", totalOrderQuantityForUpdate, ". globalFutures BEFORE this order: ", globalFuturesBeforeNtOrder);
+
+           // Update globalFutures based on the TOTAL aggregated quantity for this completed base_id
+           if(orderActionForUpdate == "Buy" || orderActionForUpdate == "BuyToCover") {
+               globalFutures += totalOrderQuantityForUpdate;
+           } else if(orderActionForUpdate == "Sell" || orderActionForUpdate == "SellShort") {
+               globalFutures -= totalOrderQuantityForUpdate;
+           }
+           Print("ACHM_LOG: [OnTimerPF] globalFutures AFTER completed order '", g_baseIds[groupIndex], "': ", globalFutures, " (updated by ", (orderActionForUpdate == "Buy" || orderActionForUpdate == "BuyToCover" ? totalOrderQuantityForUpdate : -totalOrderQuantityForUpdate), ")");
+
+           // Determine if this completed NT order was a reducing trade or flipped the sign
+           bool isReducingNtOrder = false;
+           if ((orderActionForUpdate == "Buy" || orderActionForUpdate == "BuyToCover") && globalFuturesBeforeNtOrder < 0 && globalFutures > globalFuturesBeforeNtOrder) {
+               isReducingNtOrder = true;
+           } else if ((orderActionForUpdate == "Sell" || orderActionForUpdate == "SellShort") && globalFuturesBeforeNtOrder > 0 && globalFutures < globalFuturesBeforeNtOrder) {
+               isReducingNtOrder = true;
+           } else if (globalFutures != 0 && globalFuturesBeforeNtOrder != 0 && MathAbs(globalFutures) < MathAbs(globalFuturesBeforeNtOrder)) {
+               isReducingNtOrder = true;
+           } else if (globalFutures == 0 && globalFuturesBeforeNtOrder != 0) {
+               isReducingNtOrder = true;
+           }
+           if(isReducingNtOrder) Print("ACHM_LOG: [OnTimerPF] Completed NT order '", g_baseIds[groupIndex], "' was REDUCING globalFutures magnitude.");
+
+           bool signFlippedByOrder = (globalFuturesBeforeNtOrder > 0 && globalFutures < 0) || (globalFuturesBeforeNtOrder < 0 && globalFutures > 0);
+           if (signFlippedByOrder) {
+               Print("ACHM_LOG: [OnTimerPF] Completed NT order '", g_baseIds[groupIndex], "' FLIPPED globalFutures sign. From ", globalFuturesBeforeNtOrder, " to ", globalFutures);
+           }
+
+           // If globalFutures is now zero after this completed order, close all hedges.
+           if(globalFutures == 0.0) {
+               Print("ACHM_LOG: [OnTimerPF] globalFutures is zero after completed order '", g_baseIds[groupIndex], "'. Closing all hedge orders.");
+               bool resetHappened = CloseAllHedgeOrders();
+               if (resetHappened) {
+                   Print("ACHM_LOG: [OnTimerPF] ResetTradeGroups was called by CloseAllHedgeOrders. Skipping further processing for this tick to prevent array errors.");
+                   return; // Exit OnTimer immediately
+               }
+               // The CleanupTradeGroups at the end of OnTimer will handle group removal if not returned early.
+           } else {
+               // --- Overall Hedge Adjustment Logic (now conditional on order completion) ---
+               Print("ACHM_DIAG: [OnTimerPF] Adjusting hedges based on new globalFutures=", globalFutures, " for completed base_id '", g_baseIds[groupIndex], "'");
+               // First, determine current MT5 positions for this symbol and magic number
+               int currentMt5BuyPositions = 0;
+               int currentMt5SellPositions = 0;
+               for(int i = 0; i < PositionsTotal(); i++) {
+                   if(PositionSelectByTicket(PositionGetTicket(i))) {
+                       if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+                           if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) currentMt5BuyPositions++;
+                           else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) currentMt5SellPositions++;
+                       }
+                   }
+               }
+               Print("ACHM_LOG: [HedgeAdjustPF] Current MT5 Hedges: Buy=", currentMt5BuyPositions, ", Sell=", currentMt5SellPositions);
+
+               // Initialize desiredNet hedges to current state. They will be adjusted based on the incremental NT trade.
+               int desiredNetBuyHedges = currentMt5BuyPositions;
+               int desiredNetSellHedges = currentMt5SellPositions;
+
+               double ntTradeVolume = globalFutures - globalFuturesBeforeNtOrder; // Actual volume of the completed NT trade
+               int tradeAbsQuantity = (ntTradeVolume == 0) ? 0 : (int)MathRound(MathAbs(ntTradeVolume));
+
+               if (tradeAbsQuantity > 0) { // Only adjust if there was a non-zero NT trade
+                   if (EnableHedging) {
+                       if (ntTradeVolume > 0) { // NT Bought (e.g., +2 lots)
+                           // NT's position became more long or less short.
+                           if (globalFutures > 0) { // NT's final state is Long. MT5 target is Short.
+                               desiredNetSellHedges = currentMt5SellPositions + tradeAbsQuantity;
+                               desiredNetBuyHedges = 0; // Ensure no opposing long hedge
+                           } else if (globalFutures < 0) { // NT's final state is still Short (but less short). MT5 target is Long (but less long).
+                               desiredNetBuyHedges = currentMt5BuyPositions - tradeAbsQuantity;
+                               desiredNetSellHedges = 0; // Ensure no opposing short hedge
+                           }
+                           // Note: if globalFutures == 0, this block is skipped due to earlier check (line 1706).
+                       } else { // ntTradeVolume < 0: NT Sold (e.g., -2 lots)
+                           // NT's position became more short or less long.
+                           if (globalFutures < 0) { // NT's final state is Short. MT5 target is Long.
+                               desiredNetBuyHedges = currentMt5BuyPositions + tradeAbsQuantity;
+                               desiredNetSellHedges = 0; // Ensure no opposing short hedge
+                           } else if (globalFutures > 0) { // NT's final state is still Long (but less long). MT5 target is Short (but less short).
+                               desiredNetSellHedges = currentMt5SellPositions - tradeAbsQuantity;
+                               desiredNetBuyHedges = 0; // Ensure no opposing long hedge
+                           }
+                           // Note: if globalFutures == 0, this block is skipped.
+                       }
+                   } else { // Copying NT's trade direction
+                       if (ntTradeVolume > 0) { // NT Bought, MT5 Buys
+                           desiredNetBuyHedges = currentMt5BuyPositions + tradeAbsQuantity;
+                       } else { // NT Sold, MT5 Sells
+                           desiredNetSellHedges = currentMt5SellPositions + tradeAbsQuantity;
+                       }
+                   }
+               }
+               
+               // Ensure desired positions are not negative
+               desiredNetBuyHedges = MathMax(0, desiredNetBuyHedges);
+               desiredNetSellHedges = MathMax(0, desiredNetSellHedges);
+
+               Print("ACHM_LOG: [HedgeAdjustPF] Calculated Target Hedges (after incremental adjust): Buy=", desiredNetBuyHedges, ", Sell=", desiredNetSellHedges, " (EnableHedging=", EnableHedging, ", ntTradeVolume=", ntTradeVolume, ")");
+               
+               // Adjust Sell Hedges
+               // The existing logic for sellHedgesToAdjust and buyHedgesToAdjust will now use the incrementally adjusted desiredNet values,
+               // correctly reflecting the delta needed for this specific trade.
+               int sellHedgesToAdjust = desiredNetSellHedges - currentMt5SellPositions;
+               if (sellHedgesToAdjust > 0) {
+                   Print("ACHM_LOG: [HedgeAdjustPF] Need to OPEN ", sellHedgesToAdjust, " SELL hedges for base_id '", g_baseIds[groupIndex], "'");
+                   for (int h = 0; h < sellHedgesToAdjust; h++) {
+                       if (!OpenNewHedgeOrder("Sell", g_baseIds[groupIndex], g_ntInstrumentSymbols[groupIndex], g_ntAccountNames[groupIndex])) {
+                           Print("ERROR: [HedgeAdjustPF] Failed to open new SELL hedge #", h+1, ". Breaking.");
+                           break;
+                       }
+                   }
+               } else if (sellHedgesToAdjust < 0) {
+                   int sellHedgesToClose = MathAbs(sellHedgesToAdjust);
+                   Print("ACHM_LOG: [HedgeAdjustPF] Need to CLOSE ", sellHedgesToClose, " SELL hedges.");
+                   for (int h = 0; h < sellHedgesToClose; h++) {
+                       if (!CloseOneHedgePosition("Sell")) { // CloseOneHedgePosition might need base_id if specific closure is required
+                           Print("ERROR: [HedgeAdjustPF] Failed to close existing SELL hedge #", h+1, ". Breaking.");
+                           break;
+                       }
+                   }
+               }
+
+               // Adjust Buy Hedges
+               int buyHedgesToAdjust = desiredNetBuyHedges - currentMt5BuyPositions;
+               if (buyHedgesToAdjust > 0) {
+                   Print("ACHM_LOG: [HedgeAdjustPF] Need to OPEN ", buyHedgesToAdjust, " BUY hedges for base_id '", g_baseIds[groupIndex], "'");
+                   for (int h = 0; h < buyHedgesToAdjust; h++) {
+                       if (!OpenNewHedgeOrder("Buy", g_baseIds[groupIndex], g_ntInstrumentSymbols[groupIndex], g_ntAccountNames[groupIndex])) {
+                           Print("ERROR: [HedgeAdjustPF] Failed to open new BUY hedge #", h+1, ". Breaking.");
+                           break;
+                       }
+                   }
+               } else if (buyHedgesToAdjust < 0) {
+                   int buyHedgesToClose = MathAbs(buyHedgesToAdjust);
+                   Print("ACHM_LOG: [HedgeAdjustPF] Need to CLOSE ", buyHedgesToClose, " BUY hedges.");
+                   for (int h = 0; h < buyHedgesToClose; h++) {
+                       if (!CloseOneHedgePosition("Buy")) { // CloseOneHedgePosition might need base_id
+                           Print("ERROR: [HedgeAdjustPF] Failed to close existing BUY hedge #", h+1, ". Breaking.");
+                           break;
+                       }
+                   }
                }
            }
+           // "ManageTradeGroupOnNTFill()" logic from prompt:
+           // The primary aspects (updating processed qty, marking complete for hedging) are handled.
+           // The old block (1415-1469) had specific logic for "opening or flipping" trades.
+           // If any distinct record-keeping or actions are needed for such trades *after* globalFutures/hedges are set,
+           // that would be an addition here. For now, the core request is met.
+           Print("ACHM_LOG: [OnTimerPF] Completed processing for fully filled order base_id '", g_baseIds[groupIndex], "'");
+
+       } else { // Partial fill, not yet complete for this base_id
+           Print("ACHM_LOG: [PartialFill] Partial fill received for base_id '", g_baseIds[groupIndex], "'. Processed: ", g_processedQuantities[groupIndex], "/", g_totalQuantities[groupIndex], ". Deferring globalFutures update and hedge adjustment.");
        }
+   } else if (groupIndex != -1 && g_isComplete[groupIndex]) {
+       // This case means g_isComplete was true, indicating hedging action was already taken for this base_id.
+       // This could be a late/duplicate fill message after completion.
+       Print("ACHM_WARN: [PartialFill] Received additional fill for base_id '", g_baseIds[groupIndex], "' which was already processed for completion. Qty: ", incomingNtQuantity, ". No further globalFutures/hedge action taken for this fill.");
    }
-   Print("ACHM_LOG: [HedgeAdjust] Current MT5 Hedges: Buy=", currentMt5BuyPositions, ", Sell=", currentMt5SellPositions);
-
-   // Adjust Sell Hedges
-   int sellHedgesToAdjust = desiredNetSellHedges - currentMt5SellPositions;
-   if (sellHedgesToAdjust > 0) {
-       Print("ACHM_LOG: [HedgeAdjust] Need to OPEN ", sellHedgesToAdjust, " SELL hedges. Triggering base_id: '", baseIdFromJson, "'");
-       for (int h = 0; h < sellHedgesToAdjust; h++) {
-           if (!OpenNewHedgeOrder("Sell", baseIdFromJson, ntInstrument, ntAccount)) {
-               Print("ERROR: [HedgeAdjust] Failed to open new SELL hedge #", h+1, ". Breaking.");
-               break;
-           }
-       }
-   } else if (sellHedgesToAdjust < 0) {
-       int sellHedgesToClose = MathAbs(sellHedgesToAdjust);
-       Print("ACHM_LOG: [HedgeAdjust] Need to CLOSE ", sellHedgesToClose, " SELL hedges.");
-       for (int h = 0; h < sellHedgesToClose; h++) {
-           if (!CloseOneHedgePosition("Sell")) {
-               Print("ERROR: [HedgeAdjust] Failed to close existing SELL hedge #", h+1, ". Breaking.");
-               break;
-           }
-       }
-   }
-
-   // Adjust Buy Hedges
-   int buyHedgesToAdjust = desiredNetBuyHedges - currentMt5BuyPositions;
-   if (buyHedgesToAdjust > 0) {
-       Print("ACHM_LOG: [HedgeAdjust] Need to OPEN ", buyHedgesToAdjust, " BUY hedges. Triggering base_id: '", baseIdFromJson, "'");
-       for (int h = 0; h < buyHedgesToAdjust; h++) {
-           if (!OpenNewHedgeOrder("Buy", baseIdFromJson, ntInstrument, ntAccount)) {
-               Print("ERROR: [HedgeAdjust] Failed to open new BUY hedge #", h+1, ". Breaking.");
-               break;
-           }
-       }
-   } else if (buyHedgesToAdjust < 0) {
-       int buyHedgesToClose = MathAbs(buyHedgesToAdjust);
-       Print("ACHM_LOG: [HedgeAdjust] Need to CLOSE ", buyHedgesToClose, " BUY hedges.");
-       for (int h = 0; h < buyHedgesToClose; h++) {
-           if (!CloseOneHedgePosition("Buy")) {
-               Print("ERROR: [HedgeAdjust] Failed to close existing BUY hedge #", h+1, ". Breaking.");
-               break;
-           }
-       }
-   }
-   
-   // --- Trade Group Management (g_baseIds, etc.) ---
-   // This logic is now conditional: only for opening trades or trades that flip the sign,
-   // not for purely reducing trades whose effect is already handled by globalFutures adjustment.
-   if (!isReducingNtTrade || signFlipped) {
-       Print("ACHM_LOG: [TradeGroup] NT trade '", baseIdFromJson, "' is OPENING or FLIPPING. Managing trade group.");
-       int groupIndex = -1;
-       for(int i = 0; i < ArraySize(g_baseIds); i++) {
-           if(g_baseIds[i] == baseIdFromJson) {
-               groupIndex = i;
-               Print("ACHM_LOG: [TradeGroup] Found existing group for base_id '", baseIdFromJson, "' at index ", i);
-               break;
-           }
-       }
-
-       if(groupIndex == -1) { // New opening base_id
-           groupIndex = ArraySize(g_baseIds);
-           ArrayResize(g_baseIds, groupIndex + 1);
-           ArrayResize(g_totalQuantities, groupIndex + 1);
-           ArrayResize(g_processedQuantities, groupIndex + 1);
-           ArrayResize(g_actions, groupIndex + 1);
-           ArrayResize(g_isComplete, groupIndex + 1);
-           ArrayResize(g_ntInstrumentSymbols, groupIndex + 1);
-           ArrayResize(g_ntAccountNames, groupIndex + 1);
-
-           g_baseIds[groupIndex] = baseIdFromJson;
-           g_totalQuantities[groupIndex] = totalQtyForBaseId;
-           g_processedQuantities[groupIndex] = 0; // Will be updated below
-           g_actions[groupIndex] = incomingNtAction;
-           g_isComplete[groupIndex] = false;
-           g_ntInstrumentSymbols[groupIndex] = ntInstrument;
-           g_ntAccountNames[groupIndex] = ntAccount;
-           Print("ACHM_LOG: [TradeGroup] Created NEW group for base_id '", baseIdFromJson, "' at index ", groupIndex, ". TotalQtyForGroup: ", totalQtyForBaseId, ", Action: ", incomingNtAction);
-       }
-
-       if (groupIndex != -1) { // Ensure groupIndex is valid
-           g_processedQuantities[groupIndex] += (int)incomingNtQuantity;
-           Print("ACHM_LOG: [TradeGroup] Updated processed qty for group '", baseIdFromJson, "' by ", (int)incomingNtQuantity,
-                 ". New processed: ", g_processedQuantities[groupIndex], ", Total for group: ", g_totalQuantities[groupIndex]);
-
-           if (!g_isComplete[groupIndex] && g_processedQuantities[groupIndex] >= g_totalQuantities[groupIndex]) {
-               g_isComplete[groupIndex] = true;
-               Print("ACHM_LOG: [TradeGroup] Group for base_id '", baseIdFromJson, "' is now COMPLETE. Processed: ", g_processedQuantities[groupIndex], ", Total: ", g_totalQuantities[groupIndex]);
-           }
-       }
-   } else {
-       Print("ACHM_LOG: [TradeGroup] NT trade '", baseIdFromJson, "' is REDUCING and NOT flipping. NOT creating/updating specific trade group. Its effect was handled by globalFutures adjustment.");
-   }
+   // If groupIndex remained -1 (e.g., error in logic or unexpected scenario), it will just fall through.
    
    CleanupTradeGroups();
 }
@@ -1406,13 +1844,30 @@ void OnTick()
    // Update trailing stops for all open positions
    for(int i = 0; i < PositionsTotal(); i++)
    {
-       if(PositionSelectByTicket(PositionGetTicket(i)))
+       ulong ticket = PositionGetTicket(i); // Get ticket once
+       if(ticket == 0) continue; // Skip if ticket is invalid
+
+       if(PositionSelectByTicket(ticket))
        {
-           if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+           if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol) // Also check symbol
            {
-               string orderType = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL");
+               string orderTypeString = "";
+               ENUM_POSITION_TYPE positionType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+               if(positionType == POSITION_TYPE_BUY) orderTypeString = "BUY";
+               else if(positionType == POSITION_TYPE_SELL) orderTypeString = "SELL";
+               else continue; // Skip if not BUY or SELL
+
                double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-               UpdateTrailingStop(PositionGetTicket(i), entryPrice, orderType);
+               double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+               double volume = PositionGetDouble(POSITION_VOLUME);
+
+               // Check if trailing stop should be activated
+               // Signature: bool ShouldActivateTrailing(ulong ticket, double entryPrice, double currentPrice, string orderType, double volume)
+               if(ShouldActivateTrailing(ticket, entryPrice, currentPrice, orderTypeString, volume))
+               {
+                   // Signature: bool UpdateTrailingStop(ulong ticket, double entryPrice, string orderType)
+                   UpdateTrailingStop(ticket, entryPrice, orderTypeString);
+               }
            }
        }
    }
@@ -1630,55 +2085,161 @@ ulong FindPositionByTradeId(string tradeId)
 }
 
 //+------------------------------------------------------------------+
+//| Helper to extract Base ID from MT5 Position Comment              |
+//| Comment format: "AC_HEDGE;BID:{base_id};NTA:..."               |
+//+------------------------------------------------------------------+
+string ExtractBaseIdFromComment(string comment_str)
+{
+    string base_id = "";
+    if (comment_str == NULL || StringLen(comment_str) == 0) return "";
+
+    string bid_marker = "BID:";
+    int bid_marker_len = StringLen(bid_marker);
+    int start_pos = StringFind(comment_str, bid_marker, 0);
+
+    if(start_pos != -1)
+    {
+        int value_start_pos = start_pos + bid_marker_len;
+        // Ensure value_start_pos is within bounds of the comment string
+        if (value_start_pos < StringLen(comment_str))
+        {
+            int end_pos = StringFind(comment_str, ";", value_start_pos);
+            if(end_pos != -1)
+            {
+                // Found a semicolon after BID:value
+                base_id = StringSubstr(comment_str, value_start_pos, end_pos - value_start_pos);
+            }
+            else
+            {
+                // No semicolon after BID:value, take the rest of the string
+                // This handles cases where the comment might be truncated after the base_id
+                base_id = StringSubstr(comment_str, value_start_pos);
+            }
+        }
+    }
+
+    int id_len = StringLen(base_id);
+    // Adjusted length check for typical UUIDs (32-36 chars), allowing some flexibility.
+    // Log warnings only for comments that appear to be AC_HEDGE related to reduce noise.
+    if (StringFind(comment_str, "AC_HEDGE", 0) != -1) { // Check if it's likely one of our comments
+        if (id_len > 0 && (id_len < 32 || id_len > 36) && base_id != "TEST_BASE_ID_RECOVERY") { // Allow specific test IDs
+             Print("ACHM_PARSE_WARN: ExtractBaseIdFromComment - Extracted base_id '", base_id, "' from '", comment_str, "' has unusual length: ", id_len);
+        } else if (id_len == 0 && StringFind(comment_str, "BID:", 0) != -1) {
+            // If it's an AC_HEDGE comment and contains BID: but we got no base_id, that's a specific failure.
+            Print("ACHM_PARSE_FAIL: ExtractBaseIdFromComment - Failed to extract base_id from AC_HEDGE comment containing BID: '", comment_str, "'");
+        }
+    }
+    
+    return base_id;
+}
+
+
+//+------------------------------------------------------------------+
 //| Close all hedge orders of both Buy and Sell types                  |
 //+------------------------------------------------------------------+
-void CloseAllHedgeOrders()
+bool CloseAllHedgeOrders() // Corresponds to CloseAllHedgeOrdersCorrected from prompt
     { // Start of CloseAllHedgeOrders body
         Print("DEBUG: Starting CORRECTED simplified closure of all hedge orders");
-        bool allClosed = true; // Flag to track if all closures were successful
+        bool allClosedOverall = true; // Flag to track if all closures were successful
+        bool resetOccurred = false; // Flag to indicate if ResetTradeGroups was called
 
-        int total = PositionsTotal();
-        Print("DEBUG: Found ", total, " total open positions to check.");
+        // Determine reason for closure based on globalFutures status at the beginning
+        string determined_closure_reason = "EA_ADJUSTMENT_CLOSE"; // Default if not specifically for globalFutures zero
+        if (globalFutures == 0.0) {
+            determined_closure_reason = "EA_GLOBALFUTURES_ZERO_CLOSE";
+        }
+        Print("DEBUG: CloseAllHedgeOrders called. Reason determined as: ", determined_closure_reason, " (globalFutures=", globalFutures, ")");
+
+        int total_positions_to_check = PositionsTotal();
+        Print("DEBUG: Found ", total_positions_to_check, " total open positions to check.");
 
         // Loop backward through positions
-        for(int i = total - 1; i >= 0; i--)
+        for(int i = total_positions_to_check - 1; i >= 0; i--)
         {
             ulong ticket = PositionGetTicket(i);
             if(ticket <= 0) continue;
 
-            // Select position without checking return value here, CTrade handles errors
-            PositionSelectByTicket(ticket);
+            if(!PositionSelectByTicket(ticket)) {
+                 Print("WARN: CloseAllHedgeOrders - Could not select position by ticket ", ticket, " for pre-close checks. Skipping.");
+                 continue;
+            }
 
-            // Check if the position matches the EA's Symbol and MagicNumber
             string posSymbol = PositionGetString(POSITION_SYMBOL);
             long posMagic = PositionGetInteger(POSITION_MAGIC);
+            string posComment = PositionGetString(POSITION_COMMENT); // Get comment before potential close
+            double posVolume = PositionGetDouble(POSITION_VOLUME);   // Get volume before potential close
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE); // Get type before potential close
 
-            // Add extra check for symbol validity before comparing
+
             if(posSymbol == "" || posMagic == 0)
             {
                  Print("DEBUG: Skipping position with invalid data - Ticket: ", ticket);
                  continue;
             }
 
-
             if(posSymbol == _Symbol && posMagic == MagicNumber)
             {
-                Print("DEBUG: Found matching position. Attempting to close ticket: ", ticket, ", Symbol: ", posSymbol, ", Magic: ", posMagic);
+                Print("DEBUG: Found matching position. Attempting to close ticket: ", ticket, ", Symbol: ", posSymbol, ", Magic: ", posMagic, ", Comment: '", posComment, "'");
+                
                 if(!trade.PositionClose(ticket, Slippage))
                 {
                     Print("ERROR: Failed to close position ticket: ", ticket, ". Result Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
-                    allClosed = false; // Mark failure if any close fails
+                    allClosedOverall = false;
                 }
                 else
                 {
                     Print("DEBUG: Successfully closed position ticket: ", ticket, ". Result Code: ", trade.ResultRetcode(), ", Comment: ", trade.ResultComment());
+                    // Position is closed, now send notification
+                    string base_id_closed = ExtractBaseIdFromComment(posComment);
+                    string nt_symbol_closed = "UNKNOWN";
+                    string nt_account_closed = "UNKNOWN";
+
+                    if(base_id_closed != "") {
+                        // Find in parallel arrays to get NT details
+                        for(int k=0; k < ArraySize(g_open_mt5_base_ids); k++) {
+                            // Note: g_open_mt5_pos_ids stores the MT5 position ID. We have 'ticket' which is the MT5 pos ID.
+                            // We need to find the entry that *had* this ticket.
+                            // Since the position is now closed, it might have been removed from g_open_mt5_pos_ids by OnTradeTransaction already.
+                            // The comment's base_id is more reliable here if OnTradeTransaction hasn't processed it yet.
+                            // Let's search g_open_mt5_base_ids for base_id_closed.
+                            if (k < ArraySize(g_open_mt5_base_ids) && g_open_mt5_base_ids[k] == base_id_closed) {
+                                 // Check if this slot in parallel arrays still corresponds to the *ticket* we just closed.
+                                 // This is tricky because OnTradeTransaction might have already removed it.
+                                 // For now, if base_id matches, we'll use the NT details from that slot.
+                                 // A more robust way would be if OpenNewHedgeOrder stored NT details directly in comment, or if
+                                 // CloseAllHedgeOrders had access to the original mapping for the 'ticket'.
+                                 // Given current structure, using base_id from comment to find in parallel arrays is the best bet.
+                                if (k < ArraySize(g_open_mt5_nt_symbols)) nt_symbol_closed = g_open_mt5_nt_symbols[k];
+                                if (k < ArraySize(g_open_mt5_nt_accounts)) nt_account_closed = g_open_mt5_nt_accounts[k];
+                                Print("DEBUG: CloseAllHedgeOrders - Found NT details for base_id '", base_id_closed, "' from parallel arrays: Symbol='", nt_symbol_closed, "', Account='", nt_account_closed, "'");
+                                break;
+                            }
+                        }
+                         if(nt_symbol_closed == "UNKNOWN") Print("WARN: CloseAllHedgeOrders - Could not find NT Symbol/Account in parallel arrays for base_id '", base_id_closed, "' from closed position comment '", posComment, "'. Using UNKNOWN.");
+                    } else {
+                        Print("WARN: CloseAllHedgeOrders - Could not extract base_id from comment '", posComment, "' for notification.");
+                    }
+
+                    string closed_hedge_action_str = (posType == POSITION_TYPE_BUY) ? "buy" : "sell"; // Action of the position that was closed
+
+                    if(base_id_closed != "") { // Only send if we have a base_id
+                        Print("DEBUG: CloseAllHedgeOrders - Sending notification for closed ticket ", ticket, " (BaseID: ", base_id_closed, ") with reason: ", determined_closure_reason);
+                        SendHedgeCloseNotification(base_id_closed,
+                                                   nt_symbol_closed,
+                                                   nt_account_closed,
+                                                   posVolume, // Volume of the position that was closed
+                                                   closed_hedge_action_str, // The action that closed it
+                                                   TimeCurrent(),
+                                                   determined_closure_reason);
+                    } else {
+                        Print("WARN: CloseAllHedgeOrders - Notification NOT sent for closed ticket ", ticket, " because base_id could not be determined from comment '", posComment, "'.");
+                    }
                 }
-                Sleep(250); // Slightly increased sleep
+                Sleep(250);
             }
             else
             {
                  // Optional: Log why a position was skipped
-                 // Print("DEBUG: Skipping position ticket: ", ticket, ", Symbol: ", posSymbol, ", Magic: ", posMagic);
             }
         }
 
@@ -1686,6 +2247,7 @@ void CloseAllHedgeOrders()
 
         // Check remaining positions specifically for this EA
         int remainingEaPositions = 0;
+        int total = 0;
         total = PositionsTotal();
          for(int i = total - 1; i >= 0; i--)
          {
@@ -1699,12 +2261,13 @@ void CloseAllHedgeOrders()
          }
 
         // Only reset trade groups if all targeted positions were closed successfully AND no EA positions remain
-        if(allClosed && remainingEaPositions == 0)
+        if(allClosedOverall && remainingEaPositions == 0)
         {
              Print("DEBUG: All hedge orders appear closed, resetting trade groups.");
              ResetTradeGroups();
+             resetOccurred = true;
         }
-        else if (!allClosed)
+        else if (!allClosedOverall)
         {
              Print("WARNING: Not all hedge positions could be closed. Trade groups not reset.");
         }
@@ -1712,6 +2275,7 @@ void CloseAllHedgeOrders()
         {
              Print("WARNING: EA positions might still exist (", remainingEaPositions, "). Trade groups not reset.");
         }
+        return resetOccurred;
     } // End of CloseAllHedgeOrders body
 
 // Function to calculate the take profit distance based on reward target
@@ -1883,10 +2447,35 @@ bool OpenNewHedgeOrder(string hedgeOrigin, string tradeId, string nt_instrument_
        return false;
    }
 
-   request.comment = StringFormat("%s%s_%s",
-                                  CommentPrefix, hedgeOrigin, tradeId);
+   // Determine original NT action and quantity for the comment
+   string original_nt_action_for_comment = "N/A";
+   int original_nt_qty_for_comment = 0;
+   int group_idx_for_comment = -1;
+   for(int k=0; k < ArraySize(g_baseIds); k++) {
+       if(g_baseIds[k] == tradeId) { // tradeId is base_id
+           group_idx_for_comment = k;
+           break;
+       }
+   }
+   if(group_idx_for_comment != -1) {
+       if(group_idx_for_comment < ArraySize(g_actions)) original_nt_action_for_comment = g_actions[group_idx_for_comment];
+       if(group_idx_for_comment < ArraySize(g_totalQuantities)) original_nt_qty_for_comment = g_totalQuantities[group_idx_for_comment];
+   } else {
+       Print("WARN: OpenNewHedgeOrder - Could not find trade group for base_id '", tradeId, "' to create detailed comment. Using N/A.");
+   }
+
+   // Format comment: "AC_HEDGE;BID:{base_id};NTA:{NT_ACTION};NTQ:{NT_QTY}"
+   // hedgeOrigin is the MT5 action (Buy/Sell)
+   // original_nt_action_for_comment is the original NT action (Buy/Sell/BuyToCover/SellShort)
+   // original_nt_qty_for_comment is the original NT quantity
+   request.comment = StringFormat("AC_HEDGE;BID:%s;NTA:%s;NTQ:%d;MTA:%s", // Added MTA for MT5 Action
+                                  tradeId,
+                                  original_nt_action_for_comment,
+                                  original_nt_qty_for_comment,
+                                  hedgeOrigin); // hedgeOrigin is the MT5 action
+
    request.price   = SymbolInfoDouble(_Symbol,
-                   (request.type == ORDER_TYPE_BUY) ? SYMBOL_ASK
+                  (request.type == ORDER_TYPE_BUY) ? SYMBOL_ASK
                                                     : SYMBOL_BID);
 
    /*----------------------------------------------------------------
@@ -1925,8 +2514,27 @@ bool OpenNewHedgeOrder(string hedgeOrigin, string tradeId, string nt_instrument_
                   trade.ResultRetcode(), trade.ResultComment());
       return false;
    }
-
+   
    ulong deal_ticket_for_map = trade.ResultDeal();
+   if(sent && deal_ticket_for_map > 0) // Check if 'sent' is true (trade.Buy/Sell succeeded)
+   {
+       // Increment MT5 hedges opened count for this base_id's group
+       // 'tradeId' parameter in OpenNewHedgeOrder is the base_id
+       int groupIdxOpen = -1;
+       for(int i = 0; i < ArraySize(g_baseIds); i++) {
+           if(g_baseIds[i] == tradeId) { // tradeId is the base_id here
+               groupIdxOpen = i;
+               break;
+           }
+       }
+       if(groupIdxOpen != -1 && groupIdxOpen < ArraySize(g_mt5HedgesOpenedCount)) {
+           g_mt5HedgesOpenedCount[groupIdxOpen]++;
+           Print("ACHM_DIAG: [OpenNewHedgeOrder] Incremented g_mt5HedgesOpenedCount for base_id '", tradeId, "' (index ", groupIdxOpen, ") to ", g_mt5HedgesOpenedCount[groupIdxOpen]);
+       } else {
+           Print("ACHM_DIAG: [OpenNewHedgeOrder] WARNING - Could not find group for base_id '", tradeId, "' to increment g_mt5HedgesOpenedCount. ArraySize(g_baseIds): ", ArraySize(g_baseIds), ", ArraySize(g_mt5HedgesOpenedCount): ", ArraySize(g_mt5HedgesOpenedCount));
+       }
+   }
+
    PrintFormat("INFO  – hedge %s %.2f lots  SL %.1f  TP %.1f  deal %I64u",
                (request.type == ORDER_TYPE_BUY ? "BUY" : "SELL"),
                finalVol, slPrice, tpPrice, deal_ticket_for_map);
@@ -1939,21 +2547,84 @@ bool OpenNewHedgeOrder(string hedgeOrigin, string tradeId, string nt_instrument_
            if(new_mt5_position_id > 0)
            {
                // --- Store details in new parallel arrays ---
+               // Validate array integrity before adding new position
+               if(!ValidateArrayIntegrity()) {
+                   PrintFormat("CRITICAL_ARRAY_ERROR: Array integrity check failed BEFORE adding new position. Aborting position addition.");
+                   return false;
+               }
+               
                int current_array_size = ArraySize(g_open_mt5_pos_ids);
+               PrintFormat("ARRAY_ADD: Adding new position at index %d. Current array size: %d", current_array_size, current_array_size);
+               
+               // Perform atomic array resizing
                ArrayResize(g_open_mt5_pos_ids, current_array_size + 1);
                ArrayResize(g_open_mt5_base_ids, current_array_size + 1);
                ArrayResize(g_open_mt5_nt_symbols, current_array_size + 1);
                ArrayResize(g_open_mt5_nt_accounts, current_array_size + 1);
+               ArrayResize(g_open_mt5_actions, current_array_size + 1);
+               ArrayResize(g_open_mt5_original_nt_actions, current_array_size + 1);
+               ArrayResize(g_open_mt5_original_nt_quantities, current_array_size + 1);
+               
+               // Validate that all arrays were resized correctly
+               if(ArraySize(g_open_mt5_pos_ids) != current_array_size + 1 ||
+                  ArraySize(g_open_mt5_base_ids) != current_array_size + 1 ||
+                  ArraySize(g_open_mt5_nt_symbols) != current_array_size + 1 ||
+                  ArraySize(g_open_mt5_nt_accounts) != current_array_size + 1 ||
+                  ArraySize(g_open_mt5_actions) != current_array_size + 1 ||
+                  ArraySize(g_open_mt5_original_nt_actions) != current_array_size + 1 ||
+                  ArraySize(g_open_mt5_original_nt_quantities) != current_array_size + 1) {
+                   
+                   PrintFormat("CRITICAL_ARRAY_ERROR: Array resize failed during position addition. Expected size: %d", current_array_size + 1);
+                   PrintFormat("CRITICAL_ARRAY_ERROR: Actual sizes - pos_ids=%d, base_ids=%d, nt_symbols=%d, nt_accounts=%d, actions=%d, orig_actions=%d, orig_qty=%d",
+                              ArraySize(g_open_mt5_pos_ids), ArraySize(g_open_mt5_base_ids), ArraySize(g_open_mt5_nt_symbols),
+                              ArraySize(g_open_mt5_nt_accounts), ArraySize(g_open_mt5_actions), ArraySize(g_open_mt5_original_nt_actions),
+                              ArraySize(g_open_mt5_original_nt_quantities));
+                   return false;
+               }
 
-               g_open_mt5_pos_ids[current_array_size] = (long)new_mt5_position_id;
-               g_open_mt5_base_ids[current_array_size] = tradeId; // 'tradeId' parameter is the base_id
-               g_open_mt5_nt_symbols[current_array_size] = nt_instrument_symbol;
-               g_open_mt5_nt_accounts[current_array_size] = nt_account_name;
+              g_open_mt5_pos_ids[current_array_size] = (long)new_mt5_position_id;
+              g_open_mt5_base_ids[current_array_size] = tradeId; // 'tradeId' parameter is the base_id
+              g_open_mt5_nt_symbols[current_array_size] = nt_instrument_symbol;
+              g_open_mt5_nt_accounts[current_array_size] = nt_account_name;
+              g_open_mt5_actions[current_array_size] = hedgeOrigin; // Store the MT5 action
+              PrintFormat("DEBUG_STORE: g_open_mt5_actions size after resize for index %d: %d. Value set: '%s'", current_array_size, ArraySize(g_open_mt5_actions), g_open_mt5_actions[current_array_size]);
+               
+               // For new positions, the "original NT action/qty" for the g_open_mt5_ arrays
+               // are sourced from the trade group this MT5 hedge belongs to.
+               string original_nt_action_for_open_mt5 = "";
+               int original_nt_qty_for_open_mt5 = 0;
+               int group_idx_for_open_mt5 = -1;
+               for(int k=0; k < ArraySize(g_baseIds); k++) {
+                   if(g_baseIds[k] == tradeId) { // tradeId is base_id
+                       group_idx_for_open_mt5 = k;
+                       break;
+                   }
+               }
+               if(group_idx_for_open_mt5 != -1) {
+                   if(group_idx_for_open_mt5 < ArraySize(g_actions)) original_nt_action_for_open_mt5 = g_actions[group_idx_for_open_mt5];
+                   if(group_idx_for_open_mt5 < ArraySize(g_totalQuantities)) original_nt_qty_for_open_mt5 = g_totalQuantities[group_idx_for_open_mt5];
+               } else {
+                   Print("WARN: OpenNewHedgeOrder - Could not find trade group for base_id '", tradeId, "' to populate g_open_mt5_original_nt_action/qty.");
+               }
+               g_open_mt5_original_nt_actions[current_array_size] = original_nt_action_for_open_mt5;
+               g_open_mt5_original_nt_quantities[current_array_size] = original_nt_qty_for_open_mt5;
+               
                Print("DEBUG: Stored details in parallel arrays for PosID ", (long)new_mt5_position_id, " at index ", current_array_size,
-                     ". BaseID: ", tradeId, ", NT Symbol: ", nt_instrument_symbol, ", NT Account: ", nt_account_name);
+                     ". BaseID: ", tradeId, ", NT Symbol: ", nt_instrument_symbol, ", NT Account: ", nt_account_name,
+                     ", MT5 Action: ", hedgeOrigin, // Added MT5 Action to log
+                     ", Orig NT Action: ", original_nt_action_for_open_mt5, ", Orig NT Qty: ", original_nt_qty_for_open_mt5);
+               
+               // Final validation after position addition
+               if(!ValidateArrayIntegrity()) {
+                   PrintFormat("CRITICAL_ARRAY_ERROR: Array integrity check failed AFTER adding new position at index %d", current_array_size);
+                   PrintFormat("CRITICAL_ARRAY_ERROR: This indicates the array addition process may have corrupted the arrays.");
+                   return false;
+               } else {
+                   PrintFormat("ARRAY_ADD_SUCCESS: Position added successfully at index %d. All arrays remain synchronized.", current_array_size);
+               }
 
-               // --- Existing logic for g_map_position_id_to_base_id (can be reviewed for removal later if redundant) ---
-               string original_base_id_from_nt = tradeId; // 'tradeId' param is the base_id
+              // --- Existing logic for g_map_position_id_to_base_id (can be reviewed for removal later if redundant) ---
+              string original_base_id_from_nt = tradeId; // 'tradeId' param is the base_id
                if(CheckPointer(g_map_position_id_to_base_id) == POINTER_DYNAMIC) {
                    CString *s_base_id_obj = new CString();
                    if(CheckPointer(s_base_id_obj) == POINTER_INVALID){
@@ -1965,11 +2636,13 @@ bool OpenNewHedgeOrder(string hedgeOrigin, string tradeId, string nt_instrument_
                            delete s_base_id_obj;
                        } else {
                            Print("DEBUG_HEDGE_CLOSURE: Stored mapping for MT5 PosID ", (long)new_mt5_position_id, " to base_id '", s_base_id_obj.Str(), "' in g_map_position_id_to_base_id.");
+                           Print("ACHM_DIAG: [OpenNewHedgeOrder] Mapped OLD g_map_position_id_to_base_id: MT5 PosID ", (long)new_mt5_position_id, " -> base_id '", s_base_id_obj.Str(), "'");
                        }
                    }
                } else {
                    Print("ERROR: OpenNewHedgeOrder - g_map_position_id_to_base_id (template) is not initialized. Cannot store mapping.");
                }
+                Print("ACHM_DIAG: [OpenNewHedgeOrder] Mapped PARALLEL arrays: MT5 PosID ", (long)new_mt5_position_id, " -> base_id '", tradeId, "', NT Symbol: '", nt_instrument_symbol, "', NT Account: '", nt_account_name, "' at index ", current_array_size);
            }
            else
            {
@@ -2113,63 +2786,648 @@ void HandleACAdjustmentOnHedgeClosure(string base_trade_id, double closed_volume
 }
 
 //+------------------------------------------------------------------+
-//| Remove an element from all four parallel MT5 position tracking arrays |
+//| Safely removes an element from a string array.                   |
+//| Returns true if successful, false otherwise.                     |
 //+------------------------------------------------------------------+
-void RemoveFromOpenMT5Arrays(int index_to_remove)
+bool SafeRemoveStringFromArray(string &arr[], int index_to_remove, string array_name_for_log)
 {
-    int array_size = ArraySize(g_open_mt5_pos_ids); // Assuming all parallel arrays have the same size
-    if(index_to_remove < 0 || index_to_remove >= array_size)
+    int size = ArraySize(arr);
+    if (index_to_remove < 0 || index_to_remove >= size)
     {
-        Print("ERROR: RemoveFromOpenMT5Arrays - Invalid index: ", index_to_remove, ". Array size: ", array_size);
+        PrintFormat("ERROR: SafeRemoveStringFromArray - Invalid index %d for array '%s' (size %d).", index_to_remove, array_name_for_log, size);
+        return false;
+    }
+
+    if (size == 1 && index_to_remove == 0) // Removing the only element
+    {
+        ArrayResize(arr, 0);
+    }
+    else
+    {
+        // Shift elements after the removed one
+        for (int i = index_to_remove; i < size - 1; i++)
+        {
+            arr[i] = arr[i + 1];
+        }
+        if(ArrayResize(arr, size - 1) == -1)
+        {
+            PrintFormat("ERROR: SafeRemoveStringFromArray - ArrayResize failed for array '%s' after attempting to remove index %d.", array_name_for_log, index_to_remove);
+            return false; // Resize failed, array might be in a bad state
+        }
+    }
+    // PrintFormat("DEBUG: SafeRemoveStringFromArray - Successfully removed index %d from '%s'. New size: %d", index_to_remove, array_name_for_log, ArraySize(arr));
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Remove an element from all parallel MT5 position tracking arrays |
+//+------------------------------------------------------------------+
+// Safer string array element removal function to prevent memory corruption
+bool SafeRemoveStringArrayElement(string &array[], int index_to_remove, string array_name)
+{
+    int array_size = ArraySize(array);
+    
+    if(index_to_remove < 0 || index_to_remove >= array_size) {
+        PrintFormat("SAFE_REMOVE_ERROR: Index %d out of bounds for %s (size %d)", index_to_remove, array_name, array_size);
+        return false;
+    }
+    
+    if(array_size <= 0) {
+        PrintFormat("SAFE_REMOVE_ERROR: Array %s is empty (size %d)", array_name, array_size);
+        return false;
+    }
+    
+    // Element-by-element copying to avoid ArrayCopy memory corruption
+    for(int i = index_to_remove; i < array_size - 1; i++) {
+        array[i] = array[i + 1];
+    }
+    
+    // Clear the last element and resize
+    array[array_size - 1] = "";
+    int new_size = ArrayResize(array, array_size - 1);
+    
+    if(new_size != array_size - 1) {
+        PrintFormat("SAFE_REMOVE_ERROR: ArrayResize failed for %s. Expected size %d, got %d", array_name, array_size - 1, new_size);
+        return false;
+    }
+    
+    PrintFormat("SAFE_REMOVE_SUCCESS: Removed element at index %d from %s. New size: %d", index_to_remove, array_name, new_size);
+    return true;
+}
+
+// Process all pending closures atomically to prevent array index desynchronization
+void ProcessPendingClosuresBatch()
+{
+    int num_closures = ArraySize(g_pending_closures);
+    if(num_closures == 0) {
+        return; // No closures to process
+    }
+    
+    PrintFormat("BATCH_PROCESSING: Starting atomic processing of %d pending closures", num_closures);
+    
+    // Validate array integrity before processing any closures
+    if(!ValidateArrayIntegrity()) {
+        PrintFormat("CRITICAL_BATCH_ERROR: Array integrity check failed before batch processing. Aborting to prevent further corruption.");
+        ArrayResize(g_pending_closures, 0); // Clear pending closures to prevent retry
         return;
     }
-
-    Print("DEBUG: RemoveFromOpenMT5Arrays - Removing element at index ", index_to_remove, " from parallel arrays. Current size: ", array_size);
-
-    // Shift elements for g_open_mt5_pos_ids
-    for(int j = index_to_remove; j < array_size - 1; j++)
-    {
-        g_open_mt5_pos_ids[j] = g_open_mt5_pos_ids[j+1];
-    }
-    // Shift elements for g_open_mt5_base_ids
-    for(int j = index_to_remove; j < array_size - 1; j++)
-    {
-        g_open_mt5_base_ids[j] = g_open_mt5_base_ids[j+1];
-    }
-    // Shift elements for g_open_mt5_nt_symbols
-    for(int j = index_to_remove; j < array_size - 1; j++)
-    {
-        g_open_mt5_nt_symbols[j] = g_open_mt5_nt_symbols[j+1];
-    }
-    // Shift elements for g_open_mt5_nt_accounts
-    for(int j = index_to_remove; j < array_size - 1; j++)
-    {
-        g_open_mt5_nt_accounts[j] = g_open_mt5_nt_accounts[j+1];
-    }
-
-    // Resize all arrays
-    int new_size = array_size - 1;
-    if (new_size < 0) new_size = 0; // Ensure size doesn't go negative, though logic should prevent this.
-
-    ArrayResize(g_open_mt5_pos_ids, new_size);
-    ArrayResize(g_open_mt5_base_ids, new_size);
-    ArrayResize(g_open_mt5_nt_symbols, new_size);
-    ArrayResize(g_open_mt5_nt_accounts, new_size);
     
-    Print("DEBUG: RemoveFromOpenMT5Arrays - Arrays resized to ", new_size);
+    // --- PHASE 1: Send all notifications first (without modifying arrays) ---
+    for(int i = 0; i < num_closures; i++) {
+        PositionClosureData closure = g_pending_closures[i];
+        
+        // Determine closure reason
+        string closure_reason = "UNKNOWN_MT5_CLOSE";
+        if(closure.base_id != "") {
+            if(closure.found_in_arrays) {
+                closure_reason = "EA_PARALLEL_ARRAY_CLOSE";
+            } else {
+                closure_reason = "EA_COMMENT_BASED_CLOSE";
+            }
+        }
+        
+        // Send notification if we have valid data
+        if(closure.base_id != "" && closure.mt5_action != "unknown" && closure.mt5_action != "" && closure.deal_volume > 0) {
+            PrintFormat("BATCH_PROCESSING: Sending notification[%d] for PosID %I64u - BaseID='%s', Action='%s', Volume=%f",
+                       i, closure.position_id, closure.base_id, closure.mt5_action, closure.deal_volume);
+            
+            SendHedgeCloseNotification(closure.base_id, closure.nt_symbol, closure.nt_account,
+                                     closure.deal_volume, closure.mt5_action, TimeCurrent(), closure_reason);
+        } else {
+            PrintFormat("BATCH_PROCESSING: Skipping notification[%d] for PosID %I64u - Invalid data: BaseID='%s', Action='%s', Volume=%f",
+                       i, closure.position_id, closure.base_id, closure.mt5_action, closure.deal_volume);
+        }
+    }
+    
+    // --- PHASE 2: Sort indices in descending order to prevent index invalidation during removal ---
+    int removal_indices[];
+    int removal_count = 0;
+    
+    for(int i = 0; i < num_closures; i++) {
+        if(g_pending_closures[i].found_in_arrays && g_pending_closures[i].array_index >= 0) {
+            ArrayResize(removal_indices, removal_count + 1);
+            removal_indices[removal_count] = g_pending_closures[i].array_index;
+            removal_count++;
+        }
+    }
+    
+    // Sort indices in descending order (highest first) to prevent index shifting issues
+    for(int i = 0; i < removal_count - 1; i++) {
+        for(int j = i + 1; j < removal_count; j++) {
+            if(removal_indices[i] < removal_indices[j]) {
+                int temp = removal_indices[i];
+                removal_indices[i] = removal_indices[j];
+                removal_indices[j] = temp;
+            }
+        }
+    }
+    
+    PrintFormat("BATCH_PROCESSING: Sorted %d removal indices in descending order for atomic removal", removal_count);
+    
+    // --- PHASE 3: Remove elements from arrays in descending index order ---
+    for(int i = 0; i < removal_count; i++) {
+        int index_to_remove = removal_indices[i];
+        PrintFormat("BATCH_PROCESSING: Removing array element at index %d (step %d of %d)", index_to_remove, i + 1, removal_count);
+        RemoveFromOpenMT5Arrays(index_to_remove);
+    }
+    
+    // --- PHASE 4: Update group counters and handle reconciliation ---
+    for(int i = 0; i < num_closures; i++) {
+        PositionClosureData closure = g_pending_closures[i];
+        
+        if(closure.base_id != "") {
+            // Increment MT5 hedges closed count for this base_id's group
+            int groupIdx = -1;
+            for(int k = 0; k < ArraySize(g_baseIds); k++) {
+                if(g_baseIds[k] == closure.base_id) {
+                    groupIdx = k;
+                    break;
+                }
+            }
+            
+            if(groupIdx != -1 && groupIdx < ArraySize(g_mt5HedgesClosedCount)) {
+                g_mt5HedgesClosedCount[groupIdx]++;
+                PrintFormat("BATCH_PROCESSING: Incremented g_mt5HedgesClosedCount for base_id '%s' (index %d) to %d",
+                           closure.base_id, groupIdx, g_mt5HedgesClosedCount[groupIdx]);
+                
+                // Check for group reconciliation
+                bool nt_fills_complete = (groupIdx < ArraySize(g_isComplete)) ? g_isComplete[groupIdx] : false;
+                int opened_count = (groupIdx < ArraySize(g_mt5HedgesOpenedCount)) ? g_mt5HedgesOpenedCount[groupIdx] : 0;
+                bool mt5_hedges_opened = (opened_count > 0);
+                int closed_count = g_mt5HedgesClosedCount[groupIdx];
+                bool all_mt5_hedges_closed = (closed_count >= opened_count);
+                
+                if(nt_fills_complete && mt5_hedges_opened && all_mt5_hedges_closed) {
+                    PrintFormat("BATCH_PROCESSING: Trade group '%s' (index %d) is fully reconciled. Removing.", closure.base_id, groupIdx);
+                    FinalizeAndRemoveTradeGroup(groupIdx);
+                }
+            }
+        }
+    }
+    
+    // --- PHASE 5: Final validation and cleanup ---
+    if (!ValidateArrayIntegrity()) {
+        PrintFormat("BATCH_PROCESSING_ERROR: Final validation failed after processing %d closures. Arrays may be corrupted.", num_closures);
+    } else {
+        PrintFormat("BATCH_PROCESSING_SUCCESS: Final validation passed after processing %d closures. Arrays remain synchronized.", num_closures);
+    }
+    
+    ArrayResize(g_pending_closures, 0);
+    PrintFormat("BATCH_PROCESSING: Completed atomic processing of %d closures. Cleared pending array.", num_closures);
+}
+
+// Atomic array element removal functions for different data types
+// These ensure consistent behavior across all parallel arrays
+
+bool AtomicRemoveArrayElement(string &array[], int index_to_remove, string array_name)
+{
+    int array_size = ArraySize(array);
+    
+    // Validate index bounds
+    if(index_to_remove < 0 || index_to_remove >= array_size) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Index %d out of bounds for %s (size %d)", index_to_remove, array_name, array_size);
+        return false;
+    }
+    
+    if(array_size <= 0) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Array %s is empty (size %d)", array_name, array_size);
+        return false;
+    }
+    
+    // Create new array with reduced size
+    string temp_array[];
+    int new_size = array_size - 1;
+    
+    if(new_size > 0) {
+        ArrayResize(temp_array, new_size);
+        
+        // Copy elements before the removal index
+        for(int i = 0; i < index_to_remove; i++) {
+            temp_array[i] = array[i];
+        }
+        
+        // Copy elements after the removal index (shifted down by 1)
+        for(int i = index_to_remove + 1; i < array_size; i++) {
+            temp_array[i - 1] = array[i];
+        }
+    }
+    
+    // Replace original array with new array
+    ArrayFree(array);
+    if(new_size > 0) {
+        ArrayCopy(array, temp_array);
+        ArrayFree(temp_array);
+    } else {
+        ArrayResize(array, 0);
+    }
+    
+    // Validate final size
+    int final_size = ArraySize(array);
+    if(final_size != new_size) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Size validation failed for %s. Expected %d, got %d", array_name, new_size, final_size);
+        return false;
+    }
+    
+    PrintFormat("ATOMIC_REMOVE_SUCCESS: Removed element at index %d from %s. New size: %d", index_to_remove, array_name, final_size);
+    return true;
+}
+
+bool AtomicRemoveArrayElement(long &array[], int index_to_remove, string array_name)
+{
+    int array_size = ArraySize(array);
+    
+    // Validate index bounds
+    if(index_to_remove < 0 || index_to_remove >= array_size) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Index %d out of bounds for %s (size %d)", index_to_remove, array_name, array_size);
+        return false;
+    }
+    
+    if(array_size <= 0) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Array %s is empty (size %d)", array_name, array_size);
+        return false;
+    }
+    
+    // Create new array with reduced size
+    long temp_array[];
+    int new_size = array_size - 1;
+    
+    if(new_size > 0) {
+        ArrayResize(temp_array, new_size);
+        
+        // Copy elements before the removal index
+        for(int i = 0; i < index_to_remove; i++) {
+            temp_array[i] = array[i];
+        }
+        
+        // Copy elements after the removal index (shifted down by 1)
+        for(int i = index_to_remove + 1; i < array_size; i++) {
+            temp_array[i - 1] = array[i];
+        }
+    }
+    
+    // Replace original array with new array
+    ArrayFree(array);
+    if(new_size > 0) {
+        ArrayCopy(array, temp_array);
+        ArrayFree(temp_array);
+    } else {
+        ArrayResize(array, 0);
+    }
+    
+    // Validate final size
+    int final_size = ArraySize(array);
+    if(final_size != new_size) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Size validation failed for %s. Expected %d, got %d", array_name, new_size, final_size);
+        return false;
+    }
+    
+    PrintFormat("ATOMIC_REMOVE_SUCCESS: Removed element at index %d from %s. New size: %d", index_to_remove, array_name, final_size);
+    return true;
+}
+
+bool AtomicRemoveArrayElement(int &array[], int index_to_remove, string array_name)
+{
+    int array_size = ArraySize(array);
+    
+    // Validate index bounds
+    if(index_to_remove < 0 || index_to_remove >= array_size) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Index %d out of bounds for %s (size %d)", index_to_remove, array_name, array_size);
+        return false;
+    }
+    
+    if(array_size <= 0) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Array %s is empty (size %d)", array_name, array_size);
+        return false;
+    }
+    
+    // Create new array with reduced size
+    int temp_array[];
+    int new_size = array_size - 1;
+    
+    if(new_size > 0) {
+        ArrayResize(temp_array, new_size);
+        
+        // Copy elements before the removal index
+        for(int i = 0; i < index_to_remove; i++) {
+            temp_array[i] = array[i];
+        }
+        
+        // Copy elements after the removal index (shifted down by 1)
+        for(int i = index_to_remove + 1; i < array_size; i++) {
+            temp_array[i - 1] = array[i];
+        }
+    }
+    
+    // Replace original array with new array
+    ArrayFree(array);
+    if(new_size > 0) {
+        ArrayCopy(array, temp_array);
+        ArrayFree(temp_array);
+    } else {
+        ArrayResize(array, 0);
+    }
+    
+    // Validate final size
+    int final_size = ArraySize(array);
+    if(final_size != new_size) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Size validation failed for %s. Expected %d, got %d", array_name, new_size, final_size);
+        return false;
+    }
+    
+    PrintFormat("ATOMIC_REMOVE_SUCCESS: Removed element at index %d from %s. New size: %d", index_to_remove, array_name, final_size);
+    return true;
+}
+
+void RemoveFromOpenMT5Arrays(int index_to_remove)
+{
+    // === CONCURRENT ACCESS PROTECTION ===
+    // Check if another modification is in progress
+    if(g_array_modification_in_progress) {
+        datetime current_time = TimeCurrent();
+        int wait_time = (int)(current_time - g_last_array_modification_time);
+        
+        if(wait_time < ARRAY_MODIFICATION_TIMEOUT_SECONDS) {
+            PrintFormat("ATOMIC_REMOVE_WAIT: Another array modification in progress. Waiting... (elapsed: %d seconds)", wait_time);
+            return; // Exit and let the next call handle this
+        } else {
+            PrintFormat("ATOMIC_REMOVE_TIMEOUT: Array modification timeout exceeded (%d seconds). Forcing unlock.", wait_time);
+            g_array_modification_in_progress = false; // Force unlock after timeout
+        }
+    }
+    
+    // Lock the arrays for modification
+    g_array_modification_in_progress = true;
+    g_last_array_modification_time = TimeCurrent();
+    
+    // === ATOMIC ARRAY REMOVAL IMPLEMENTATION ===
+    // This function ensures ALL parallel arrays are updated atomically to prevent corruption
+    
+    // Get current array sizes for validation
+    int pos_ids_size = ArraySize(g_open_mt5_pos_ids);
+    int actions_size = ArraySize(g_open_mt5_actions);
+    int base_ids_size = ArraySize(g_open_mt5_base_ids);
+    int nt_symbols_size = ArraySize(g_open_mt5_nt_symbols);
+    int nt_accounts_size = ArraySize(g_open_mt5_nt_accounts);
+    int orig_nt_actions_size = ArraySize(g_open_mt5_original_nt_actions);
+    int orig_nt_qty_size = ArraySize(g_open_mt5_original_nt_quantities);
+    
+    // --- ENTRY DIAGNOSTICS ---
+    PrintFormat("ATOMIC_REMOVE: ENTRY - index_to_remove=%d", index_to_remove);
+    PrintFormat("ATOMIC_REMOVE: BEFORE - Array sizes: pos_ids=%d, actions=%d, base_ids=%d, nt_symbols=%d, nt_accounts=%d, orig_actions=%d, orig_qty=%d",
+               pos_ids_size, actions_size, base_ids_size, nt_symbols_size, nt_accounts_size, orig_nt_actions_size, orig_nt_qty_size);
+    
+    // Log element being removed for tracking
+    if(index_to_remove >= 0 && index_to_remove < pos_ids_size) {
+        long pos_id = g_open_mt5_pos_ids[index_to_remove];
+        string action = (index_to_remove < actions_size) ? g_open_mt5_actions[index_to_remove] : "OUT_OF_BOUNDS";
+        string base_id = (index_to_remove < base_ids_size) ? g_open_mt5_base_ids[index_to_remove] : "OUT_OF_BOUNDS";
+        PrintFormat("ATOMIC_REMOVE: Removing element[%d] - PosID=%I64d, Action='%s', BaseID='%s'",
+                   index_to_remove, pos_id, action, base_id);
+    }
+    
+    // === VALIDATION PHASE ===
+    // Check if index is valid for the primary reference array
+    if(index_to_remove < 0 || index_to_remove >= pos_ids_size) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Invalid index %d for primary array g_open_mt5_pos_ids (size %d). Aborting to prevent corruption.",
+                   index_to_remove, pos_ids_size);
+        g_array_modification_in_progress = false; // Unlock before returning
+        return;
+    }
+    
+    // Check for array size inconsistencies BEFORE attempting removal
+    if(actions_size != pos_ids_size || base_ids_size != pos_ids_size ||
+       nt_symbols_size != pos_ids_size || nt_accounts_size != pos_ids_size ||
+       orig_nt_actions_size != pos_ids_size || orig_nt_qty_size != pos_ids_size) {
+        
+        PrintFormat("ATOMIC_REMOVE_ERROR: Array size mismatch detected BEFORE removal. Cannot proceed safely.");
+        PrintFormat("ATOMIC_REMOVE_ERROR: Expected all arrays to have size %d, but found: actions=%d, base_ids=%d, nt_symbols=%d, nt_accounts=%d, orig_actions=%d, orig_qty=%d",
+                   pos_ids_size, actions_size, base_ids_size, nt_symbols_size, nt_accounts_size, orig_nt_actions_size, orig_nt_qty_size);
+        g_array_modification_in_progress = false; // Unlock before returning
+        return;
+    }
+    
+    // === ATOMIC REMOVAL PHASE ===
+    // Create backup copies of all arrays for potential rollback
+    long backup_pos_ids[];
+    string backup_actions[];
+    string backup_base_ids[];
+    string backup_nt_symbols[];
+    string backup_nt_accounts[];
+    string backup_orig_nt_actions[];
+    int backup_orig_nt_qty[];
+    
+    // Copy current state for rollback capability
+    ArrayCopy(backup_pos_ids, g_open_mt5_pos_ids);
+    ArrayCopy(backup_actions, g_open_mt5_actions);
+    ArrayCopy(backup_base_ids, g_open_mt5_base_ids);
+    ArrayCopy(backup_nt_symbols, g_open_mt5_nt_symbols);
+    ArrayCopy(backup_nt_accounts, g_open_mt5_nt_accounts);
+    ArrayCopy(backup_orig_nt_actions, g_open_mt5_original_nt_actions);
+    ArrayCopy(backup_orig_nt_qty, g_open_mt5_original_nt_quantities);
+    
+    bool removal_success = true;
+    string failed_arrays = "";
+    
+    // Perform atomic removal using consistent method for ALL arrays
+    if(!AtomicRemoveArrayElement(g_open_mt5_pos_ids, index_to_remove, "g_open_mt5_pos_ids")) {
+        removal_success = false;
+        failed_arrays += "pos_ids ";
+    }
+    
+    if(!AtomicRemoveArrayElement(g_open_mt5_actions, index_to_remove, "g_open_mt5_actions")) {
+        removal_success = false;
+        failed_arrays += "actions ";
+    }
+    
+    if(!AtomicRemoveArrayElement(g_open_mt5_base_ids, index_to_remove, "g_open_mt5_base_ids")) {
+        removal_success = false;
+        failed_arrays += "base_ids ";
+    }
+    
+    if(!AtomicRemoveArrayElement(g_open_mt5_nt_symbols, index_to_remove, "g_open_mt5_nt_symbols")) {
+        removal_success = false;
+        failed_arrays += "nt_symbols ";
+    }
+    
+    if(!AtomicRemoveArrayElement(g_open_mt5_nt_accounts, index_to_remove, "g_open_mt5_nt_accounts")) {
+        removal_success = false;
+        failed_arrays += "nt_accounts ";
+    }
+    
+    if(!AtomicRemoveArrayElement(g_open_mt5_original_nt_actions, index_to_remove, "g_open_mt5_original_nt_actions")) {
+        removal_success = false;
+        failed_arrays += "orig_nt_actions ";
+    }
+    
+    if(!AtomicRemoveArrayElement(g_open_mt5_original_nt_quantities, index_to_remove, "g_open_mt5_original_nt_quantities")) {
+        removal_success = false;
+        failed_arrays += "orig_nt_qty ";
+    }
+    
+    // === VALIDATION AND ROLLBACK PHASE ===
+    if(!removal_success) {
+        PrintFormat("ATOMIC_REMOVE_ERROR: Removal failed for arrays: %s. Performing rollback...", failed_arrays);
+        
+        // Rollback all arrays to their original state
+        ArrayCopy(g_open_mt5_pos_ids, backup_pos_ids);
+        ArrayCopy(g_open_mt5_actions, backup_actions);
+        ArrayCopy(g_open_mt5_base_ids, backup_base_ids);
+        ArrayCopy(g_open_mt5_nt_symbols, backup_nt_symbols);
+        ArrayCopy(g_open_mt5_nt_accounts, backup_nt_accounts);
+        ArrayCopy(g_open_mt5_original_nt_actions, backup_orig_nt_actions);
+        ArrayCopy(g_open_mt5_original_nt_quantities, backup_orig_nt_qty);
+        
+        PrintFormat("ATOMIC_REMOVE_ERROR: Rollback completed. All arrays restored to original state.");
+        g_array_modification_in_progress = false; // Unlock before returning
+        return;
+    }
+    
+    // Final validation - ensure all arrays have the same size after removal
+    int final_pos_ids_size = ArraySize(g_open_mt5_pos_ids);
+    int final_actions_size = ArraySize(g_open_mt5_actions);
+    int final_base_ids_size = ArraySize(g_open_mt5_base_ids);
+    int final_nt_symbols_size = ArraySize(g_open_mt5_nt_symbols);
+    int final_nt_accounts_size = ArraySize(g_open_mt5_nt_accounts);
+    int final_orig_nt_actions_size = ArraySize(g_open_mt5_original_nt_actions);
+    int final_orig_nt_qty_size = ArraySize(g_open_mt5_original_nt_quantities);
+    
+    int expected_final_size = pos_ids_size - 1;
+    
+    if(final_pos_ids_size != expected_final_size || final_actions_size != expected_final_size ||
+       final_base_ids_size != expected_final_size || final_nt_symbols_size != expected_final_size ||
+       final_nt_accounts_size != expected_final_size || final_orig_nt_actions_size != expected_final_size ||
+       final_orig_nt_qty_size != expected_final_size) {
+        
+        PrintFormat("ATOMIC_REMOVE_ERROR: Post-removal size validation failed. Expected all arrays to have size %d", expected_final_size);
+        PrintFormat("ATOMIC_REMOVE_ERROR: Actual sizes: pos_ids=%d, actions=%d, base_ids=%d, nt_symbols=%d, nt_accounts=%d, orig_actions=%d, orig_qty=%d",
+                   final_pos_ids_size, final_actions_size, final_base_ids_size, final_nt_symbols_size,
+                   final_nt_accounts_size, final_orig_nt_actions_size, final_orig_nt_qty_size);
+        
+        // Perform emergency rollback
+        PrintFormat("ATOMIC_REMOVE_ERROR: Performing emergency rollback due to size validation failure...");
+        ArrayCopy(g_open_mt5_pos_ids, backup_pos_ids);
+        ArrayCopy(g_open_mt5_actions, backup_actions);
+        ArrayCopy(g_open_mt5_base_ids, backup_base_ids);
+        ArrayCopy(g_open_mt5_nt_symbols, backup_nt_symbols);
+        ArrayCopy(g_open_mt5_nt_accounts, backup_nt_accounts);
+        ArrayCopy(g_open_mt5_original_nt_actions, backup_orig_nt_actions);
+        ArrayCopy(g_open_mt5_original_nt_quantities, backup_orig_nt_qty);
+        
+        PrintFormat("ATOMIC_REMOVE_ERROR: Emergency rollback completed.");
+        g_array_modification_in_progress = false; // Unlock before returning
+        return;
+    }
+    
+    // === SUCCESS LOGGING ===
+    PrintFormat("ATOMIC_REMOVE_SUCCESS: Element at index %d removed successfully from all parallel arrays", index_to_remove);
+    PrintFormat("ATOMIC_REMOVE_SUCCESS: AFTER - All arrays now have size %d (reduced from %d)", expected_final_size, pos_ids_size);
+    
+    // Log first few remaining elements for verification
+    for(int i = 0; i < MathMin(3, final_pos_ids_size); i++) {
+        PrintFormat("ATOMIC_REMOVE_SUCCESS: Remaining[%d] - PosID=%I64d, Action='%s', BaseID='%s'",
+                   i, g_open_mt5_pos_ids[i], g_open_mt5_actions[i], g_open_mt5_base_ids[i]);
+    }
+    
+    // Clean up backup arrays
+    ArrayFree(backup_pos_ids);
+    ArrayFree(backup_actions);
+    ArrayFree(backup_base_ids);
+    ArrayFree(backup_nt_symbols);
+    ArrayFree(backup_nt_accounts);
+    ArrayFree(backup_orig_nt_actions);
+    ArrayFree(backup_orig_nt_qty);
+    
+    // === UNLOCK AND EXIT ===
+    g_array_modification_in_progress = false; // Unlock arrays after successful completion
+    PrintFormat("ATOMIC_REMOVE_SUCCESS: Array modification lock released. Operation completed successfully.");
+}
+
+//+------------------------------------------------------------------+
+//| Array Integrity Validation Function                             |
+//| Checks if all parallel arrays are synchronized                  |
+//+------------------------------------------------------------------+
+bool ValidateArrayIntegrity(bool log_details = false)
+{
+    int pos_ids_size = ArraySize(g_open_mt5_pos_ids);
+    int actions_size = ArraySize(g_open_mt5_actions);
+    int base_ids_size = ArraySize(g_open_mt5_base_ids);
+    int nt_symbols_size = ArraySize(g_open_mt5_nt_symbols);
+    int nt_accounts_size = ArraySize(g_open_mt5_nt_accounts);
+    int orig_nt_actions_size = ArraySize(g_open_mt5_original_nt_actions);
+    int orig_nt_qty_size = ArraySize(g_open_mt5_original_nt_quantities);
+    
+    bool integrity_ok = true;
+    
+    if(log_details) {
+        PrintFormat("ARRAY_INTEGRITY_CHECK: Array sizes - pos_ids=%d, actions=%d, base_ids=%d, nt_symbols=%d, nt_accounts=%d, orig_actions=%d, orig_qty=%d",
+                   pos_ids_size, actions_size, base_ids_size, nt_symbols_size, nt_accounts_size, orig_nt_actions_size, orig_nt_qty_size);
+    }
+    
+    // Check if all arrays have the same size
+    if(actions_size != pos_ids_size || base_ids_size != pos_ids_size ||
+       nt_symbols_size != pos_ids_size || nt_accounts_size != pos_ids_size ||
+       orig_nt_actions_size != pos_ids_size || orig_nt_qty_size != pos_ids_size) {
+        
+        integrity_ok = false;
+        PrintFormat("ARRAY_INTEGRITY_ERROR: Size mismatch detected! Expected all arrays to have size %d", pos_ids_size);
+        PrintFormat("ARRAY_INTEGRITY_ERROR: Actual sizes - actions=%d, base_ids=%d, nt_symbols=%d, nt_accounts=%d, orig_actions=%d, orig_qty=%d",
+                   actions_size, base_ids_size, nt_symbols_size, nt_accounts_size, orig_nt_actions_size, orig_nt_qty_size);
+    }
+    
+    // Check for empty action strings which indicate corruption
+    for(int i = 0; i < MathMin(pos_ids_size, actions_size); i++) {
+        if(g_open_mt5_actions[i] == "") {
+            integrity_ok = false;
+            PrintFormat("ARRAY_INTEGRITY_ERROR: Empty action string found at index %d (PosID=%I64d)", i,
+                       (i < pos_ids_size) ? g_open_mt5_pos_ids[i] : -1);
+        }
+    }
+    
+    if(log_details && integrity_ok) {
+        PrintFormat("ARRAY_INTEGRITY_CHECK: All arrays are properly synchronized (size=%d)", pos_ids_size);
+    }
+    
+    return integrity_ok;
 }
 
 //+------------------------------------------------------------------+
 //| TradeTransaction event handler                                   |
 //+------------------------------------------------------------------+
+// Structure to hold position closure data for batch processing
+struct PositionClosureData
+{
+    ulong position_id;
+    ulong deal_ticket;
+    double deal_volume;
+    string base_id;
+    string nt_symbol;
+    string nt_account;
+    string mt5_action;
+    string closure_reason;
+    int array_index;
+    bool found_in_arrays;
+};
+
+// Global array to collect position closures for batch processing
+PositionClosureData g_pending_closures[];
+
 void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
-    Print("DEBUG_HEDGE_CLOSURE: OnTradeTransaction fired. Type: ", EnumToString(trans.type), ", Deal: ", trans.deal, ", Order: ", trans.order, ", Pos: ", trans.position);
+  // --- DIAGNOSTIC LOGGING FOR CONCURRENT PROCESSING INVESTIGATION ---
+  static int transaction_counter = 0;
+  transaction_counter++;
+  PrintFormat("ARRAY_CORRUPTION_DIAG: OnTradeTransaction ENTRY #%d - Type=%s, Deal=%I64u, Order=%I64u, Position=%I64u",
+             transaction_counter, EnumToString(trans.type), trans.deal, trans.order, trans.position);
+  PrintFormat("ARRAY_CORRUPTION_DIAG: Current array sizes at transaction start: pos_ids=%d, actions=%d, base_ids=%d",
+             ArraySize(g_open_mt5_pos_ids), ArraySize(g_open_mt5_actions), ArraySize(g_open_mt5_base_ids));
 
-    if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
-    {
+  Print("DEBUG_HEDGE_CLOSURE: OnTradeTransaction fired. Type: ", EnumToString(trans.type), ", Deal: ", trans.deal, ", Order: ", trans.order, ", Pos: ", trans.position);
+  Print("ACHM_DIAG: [OnTradeTransaction] Entry. trans.type=", EnumToString(trans.type), ", trans.deal=", trans.deal, ", trans.position=", trans.position);
+
+  if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+  {
         Print("DEBUG_HEDGE_CLOSURE: Not a DEAL_ADD transaction. Skipping.");
         return;
     }
@@ -2209,207 +3467,378 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             return;
         }
 
-        // Declare details_for_notification here to be in scope for later Print statements (e.g. line 2316+)
-        // PositionTradeDetails *details_for_notification = NULL; // Removed
-
-        // Variables for SendHedgeCloseNotification, populated before TryGetValue
+        // Variables for SendHedgeCloseNotification
         double notification_deal_volume = 0.0;
-        string notification_hedge_action = "unknown";
-        ulong current_deal_ticket_for_notification = trans.deal; // Use the current transaction's deal ticket
+        string notification_hedge_action = "unknown"; // Action of the MT5 deal that closed the hedge
+        ulong current_deal_ticket_for_notification = trans.deal;
 
-        if(HistoryDealSelect(current_deal_ticket_for_notification))
-        {
+        if(HistoryDealSelect(current_deal_ticket_for_notification)) {
             notification_deal_volume = HistoryDealGetDouble(current_deal_ticket_for_notification, DEAL_VOLUME);
-            ENUM_DEAL_TYPE deal_type_for_notification = (ENUM_DEAL_TYPE)HistoryDealGetInteger(current_deal_ticket_for_notification, DEAL_TYPE);
-            
-            // The 'closed_hedge_action' for the notification is the action of the deal that closed the hedge.
-            if(deal_type_for_notification == DEAL_TYPE_SELL) notification_hedge_action = "sell";
-            else if(deal_type_for_notification == DEAL_TYPE_BUY) notification_hedge_action = "buy";
-            // else it remains "unknown"
-            PrintFormat("DEBUG_HEDGE_ACTION: Closing Deal Ticket: %I64u, Deal Type for Notification: %s (%d), Determined Notification Hedge Action: %s", current_deal_ticket_for_notification, EnumToString(deal_type_for_notification), deal_type_for_notification, notification_hedge_action);
-        }
-        else
-        {
-            Print("ERROR: OnTradeTransaction - Could not select deal ", current_deal_ticket_for_notification, " to get volume/action for notification. PosID: ", closing_deal_position_id);
-            // Notification might not be sendable or will have default/unknown values if this fails
-        }
-
-        // Removed old g_map_position_id_to_details lookup logic.
-        // New parallel array lookup will be done inside if(is_position_closed) block.
-
-        // --- Existing logic to retrieve base_id_for_prefix for AC Adjustment (remains for now) ---
-        string base_id_for_prefix = ""; // This is for AC adjustment logic later
-        if(CheckPointer(g_map_position_id_to_base_id) == POINTER_DYNAMIC) {
-            CString *retrieved_s_base_id_ptr = NULL;
-            if(g_map_position_id_to_base_id.TryGetValue((long)closing_deal_position_id, retrieved_s_base_id_ptr)) {
-                if(CheckPointer(retrieved_s_base_id_ptr) == POINTER_DYNAMIC) {
-                    base_id_for_prefix = retrieved_s_base_id_ptr.Str();
-                    Print("DEBUG_HEDGE_CLOSURE: For AC - Retrieved base_id '", base_id_for_prefix, "' from OLD map for position_id ", (long)closing_deal_position_id, ".");
-                } else {
-                     Print("DEBUG_HEDGE_CLOSURE: For AC - Retrieved NULL CString* from OLD g_map_position_id_to_base_id for PositionID ", closing_deal_position_id);
-                }
-            } else {
-                 Print("DEBUG_HEDGE_CLOSURE: For AC - Could not find key (PositionID ", closing_deal_position_id, ") in OLD g_map_position_id_to_base_id. Map count: ", g_map_position_id_to_base_id.Count());
-            }
         } else {
-            Print("ERROR: OnTradeTransaction - OLD g_map_position_id_to_base_id is not initialized. Cannot retrieve mapping for PositionID ", closing_deal_position_id);
+            Print("ERROR: OnTradeTransaction - Could not select deal ", current_deal_ticket_for_notification, " to get volume/action for notification. PosID: ", closing_deal_position_id);
         }
-        // Note: base_id_for_prefix is used by AC logic later. If it's empty, that logic might be affected.
-        // The notification logic below will rely on notification_base_id.
 
-        // Now, check if this position (closing_deal_position_id) is fully closed.
+        // --- Determine if the position is fully closed ---
         CPositionInfo posInfo;
         bool is_position_closed = true; // Assume closed unless found open
+        string closed_position_comment = ""; // Store comment of the closing position
 
-        if(posInfo.SelectByTicket(closing_deal_position_id))
-        {
-            if(posInfo.Volume() > 0)
-            {
-                is_position_closed = false; // Still has volume
-                Print("DEBUG_HEDGE_CLOSURE: Position #", closing_deal_position_id, " is NOT fully closed yet. Volume: ", posInfo.Volume());
+        // Check if the position still exists to determine if it's fully closed
+        if(posInfo.SelectByTicket(closing_deal_position_id)) {
+            closed_position_comment = posInfo.Comment(); // Get comment BEFORE checking volume
+            if(posInfo.Volume() > 0) {
+                is_position_closed = false;
+                Print("DEBUG_HEDGE_CLOSURE: Position #", closing_deal_position_id, " is NOT fully closed yet. Volume: ", posInfo.Volume(), ", Comment: '", closed_position_comment, "'");
+            } else {
+                Print("DEBUG_HEDGE_CLOSURE: Position #", closing_deal_position_id, " selected and has 0 volume. Comment: '", closed_position_comment, "'");
+            }
+        } else {
+            // If SelectByTicket fails, it implies the position no longer exists, so it's closed.
+            Print("DEBUG_HEDGE_CLOSURE: Position #", closing_deal_position_id, " not found by SelectByTicket. Assuming fully closed.");
+            // Attempt to get comment from the order that led to this deal, if possible, as a last resort for comment.
+            ulong order_ticket_of_closing_deal = HistoryDealGetInteger(deal_ticket, DEAL_ORDER);
+            if (order_ticket_of_closing_deal > 0 && HistoryOrderSelect(order_ticket_of_closing_deal)) {
+                closed_position_comment = HistoryOrderGetString(order_ticket_of_closing_deal, ORDER_COMMENT);
+                Print("DEBUG_HEDGE_CLOSURE: Fallback - Got comment '", closed_position_comment, "' from order #", order_ticket_of_closing_deal, " associated with closing deal.");
             }
         }
-        else
-        {
-            Print("DEBUG_HEDGE_CLOSURE: Position #", closing_deal_position_id, " not found by SelectByTicket. Assuming closed.");
-        }
 
-        if(is_position_closed)
-        {
-            Print("DEBUG_HEDGE_CLOSURE: Position #", closing_deal_position_id, " is now fully closed.");
+        // Variables for prioritized Base ID and MT5 Action Retrieval
+        string notify_base_id = "";
+        string notify_nt_symbol = "UNKNOWN_SYMBOL"; // Default
+        string notify_nt_account = "UNKNOWN_ACCOUNT"; // Default
+        string stored_mt5_action = "unknown"; // Default
+        bool details_found_from_parallel_arrays = false;
+        int removal_index = -1;
 
-            // --- BEGIN HEDGE CLOSURE NOTIFICATION LOGIC (using parallel arrays) ---
-            string notify_base_id = "";
-            string notify_nt_symbol = "";
-            string notify_nt_account = "";
-            bool details_found = false;
-            int removal_index = -1; // To store the index for removal from parallel arrays
+        if(is_position_closed) {
+            Print("DEBUG_HEDGE_CLOSURE: Position #", closing_deal_position_id, " is considered fully closed.");
 
+            // --- BATCH PROCESSING APPROACH: Collect closure data without immediate array modification ---
+            PrintFormat("BATCH_PROCESSING: Collecting closure data for PosID %I64u", closing_deal_position_id);
+            
+            // --- DIAGNOSTIC LOGGING FOR ARRAY CORRUPTION INVESTIGATION ---
+            PrintFormat("ARRAY_CORRUPTION_DIAG: BEFORE lookup - Array sizes: pos_ids=%d, actions=%d, base_ids=%d, nt_symbols=%d, nt_accounts=%d",
+                       ArraySize(g_open_mt5_pos_ids), ArraySize(g_open_mt5_actions), ArraySize(g_open_mt5_base_ids),
+                       ArraySize(g_open_mt5_nt_symbols), ArraySize(g_open_mt5_nt_accounts));
+            
+            // Print first few elements for corruption detection
+            for(int debug_i = 0; debug_i < MathMin(3, ArraySize(g_open_mt5_pos_ids)); debug_i++) {
+                string debug_action = (debug_i < ArraySize(g_open_mt5_actions)) ? g_open_mt5_actions[debug_i] : "OUT_OF_BOUNDS";
+                string debug_base_id = (debug_i < ArraySize(g_open_mt5_base_ids)) ? g_open_mt5_base_ids[debug_i] : "OUT_OF_BOUNDS";
+                PrintFormat("ARRAY_CORRUPTION_DIAG: Index[%d] - PosID=%I64d, Action='%s', BaseID='%s'",
+                           debug_i, g_open_mt5_pos_ids[debug_i], debug_action, debug_base_id);
+            }
+
+            // --- Prioritized Base ID and MT5 Action Retrieval for Notification ---
+            // 1. Try to find details in parallel arrays using the PositionID
+            Print("DEBUG_HEDGE_CLOSURE: Attempting lookup in g_open_mt5_pos_ids for PosID ", closing_deal_position_id);
             for(int i = 0; i < ArraySize(g_open_mt5_pos_ids); i++) {
-                if(g_open_mt5_pos_ids[i] == (long)closing_deal_position_id) { // closing_deal_position_id is trans.position
+                PrintFormat("ARRAY_CORRUPTION_DIAG: Checking index[%d] - PosID=%I64d vs target=%I64u",
+                           i, g_open_mt5_pos_ids[i], closing_deal_position_id);
+                           
+                if(g_open_mt5_pos_ids[i] == (long)closing_deal_position_id) {
+                    PrintFormat("ARRAY_CORRUPTION_DIAG: MATCH found at index[%d] for PosID=%I64u", i, closing_deal_position_id);
+                    
+                    // Bounds checking before accessing parallel arrays
+                    if(i >= ArraySize(g_open_mt5_base_ids)) {
+                        PrintFormat("ARRAY_CORRUPTION_ERROR: Index[%d] out of bounds for g_open_mt5_base_ids (size=%d)", i, ArraySize(g_open_mt5_base_ids));
+                        break;
+                    }
+                    if(i >= ArraySize(g_open_mt5_nt_symbols)) {
+                        PrintFormat("ARRAY_CORRUPTION_ERROR: Index[%d] out of bounds for g_open_mt5_nt_symbols (size=%d)", i, ArraySize(g_open_mt5_nt_symbols));
+                        break;
+                    }
+                    if(i >= ArraySize(g_open_mt5_nt_accounts)) {
+                        PrintFormat("ARRAY_CORRUPTION_ERROR: Index[%d] out of bounds for g_open_mt5_nt_accounts (size=%d)", i, ArraySize(g_open_mt5_nt_accounts));
+                        break;
+                    }
+                    
                     notify_base_id = g_open_mt5_base_ids[i];
                     notify_nt_symbol = g_open_mt5_nt_symbols[i];
                     notify_nt_account = g_open_mt5_nt_accounts[i];
-                    details_found = true;
-                    removal_index = i; // Store the index for later removal
-                    Print("DEBUG: Found details in parallel arrays for closed PosID ", (long)closing_deal_position_id, " at index ", i,
-                          ". BaseID: ", notify_base_id, ", NT Symbol: ", notify_nt_symbol, ", NT Account: ", notify_nt_account);
-                    break;
-                }
-            }
-
-            if(details_found) {
-                // notification_deal_volume and notification_hedge_action were sourced earlier in OnTradeTransaction
-                // from the current deal (trans.deal details).
-                if (notification_hedge_action != "unknown" && notification_deal_volume > 0) {
-                    SendHedgeCloseNotification(
-                        notify_base_id,
-                        notify_nt_symbol,
-                        notify_nt_account,
-                        notification_deal_volume,    // Sourced from trans.deal's volume
-                        notification_hedge_action, // Sourced from trans.deal's type
-                        TimeGMT()
-                    );
-                    PrintFormat("DEBUG_HEDGE_CLOSURE: Successfully sent hedge close notification via parallel arrays for PosID %d. BaseID: %s", (long)closing_deal_position_id, notify_base_id);
-
-                    // Clean up the parallel arrays now that the notification is sent and details were found
-                    if(removal_index != -1) {
-                        RemoveFromOpenMT5Arrays(removal_index);
+                    
+                    // Critical diagnostic for g_open_mt5_actions access
+                    PrintFormat("ARRAY_CORRUPTION_DIAG: For PosID %I64u, found_index=%d. ArraySize(g_open_mt5_actions)=%d. Attempting to read g_open_mt5_actions[found_index].", closing_deal_position_id, i, ArraySize(g_open_mt5_actions));
+                    if (i >= 0 && i < ArraySize(g_open_mt5_actions)) {
+                        stored_mt5_action = g_open_mt5_actions[i];
+                        PrintFormat("ARRAY_CORRUPTION_DIAG: Successfully read g_open_mt5_actions[%d]='%s'", i, stored_mt5_action);
                     } else {
-                        // This case should ideally not be reached if details_found is true
-                        Print("ERROR: OnTradeTransaction - removal_index was not set despite details_found being true. Cannot clean up parallel arrays for PosID ", (long)closing_deal_position_id);
+                        PrintFormat("ARRAY_CORRUPTION_ERROR: Invalid index %d for g_open_mt5_actions (size %d) for PosID %I64u. Setting action to empty.", i, ArraySize(g_open_mt5_actions), closing_deal_position_id);
+                        stored_mt5_action = "";
                     }
-                } else {
-                    PrintFormat("DEBUG_HEDGE_CLOSURE: ERROR - Cannot send notification for PosID %d (found in parallel arrays) due to invalid deal details. Volume: %f, Action: %s. Arrays not cleaned.", (long)closing_deal_position_id, notification_deal_volume, notification_hedge_action);
-                }
-            } else {
-                Print("ERROR: Could not find details in parallel arrays for closed PosID ", (long)closing_deal_position_id, ". Notification not sent, arrays not cleaned.");
-            }
-            // --- END HEDGE CLOSURE NOTIFICATION LOGIC (using parallel arrays) ---
-
-            // Parameters for HandleACAdjustmentOnHedgeClosure (existing logic, uses base_id_for_prefix from old map g_map_position_id_to_base_id and g_baseIds array)
-            ulong ac_closing_deal_ticket = trans.deal; // Can re-use trans.deal or use notify_closing_deal_ticket
-            double ac_closing_deal_volume = 0;
-            double ac_closing_deal_price = 0; // Not used by HandleACAdjustmentOnHedgeClosure
-            string nt_instrument_symbol_for_ac = "";
-            string nt_account_name_for_ac = "";
-            int groupIndex = -1; // To find active NT details for AC
-
-            for(int i = 0; i < ArraySize(g_baseIds); i++)
-            {
-                // This loop specifically looks for an *active* (not complete) trade group for AC
-                if(g_baseIds[i] == base_id_for_prefix && (i < ArraySize(g_isComplete) && !g_isComplete[i]))
-                {
-                    groupIndex = i;
-                    if(groupIndex < ArraySize(g_ntInstrumentSymbols)) nt_instrument_symbol_for_ac = g_ntInstrumentSymbols[groupIndex];
-                    if(groupIndex < ArraySize(g_ntAccountNames)) nt_account_name_for_ac = g_ntAccountNames[groupIndex];
+                    
+                    details_found_from_parallel_arrays = true;
+                    removal_index = i;
+                    PrintFormat("ARRAY_CORRUPTION_DIAG: Found details in parallel arrays for PosID %I64u at index %d. BaseID='%s', MT5_Action='%s'", closing_deal_position_id, i, notify_base_id, stored_mt5_action);
                     break;
                 }
             }
+            
+            if(!details_found_from_parallel_arrays) {
+                PrintFormat("ARRAY_CORRUPTION_DIAG: NO MATCH found in parallel arrays for PosID=%I64u. Array size was %d", closing_deal_position_id, ArraySize(g_open_mt5_pos_ids));
+            }
 
-            if(groupIndex != -1)
-            {
-                Print("DEBUG_HEDGE_CLOSURE: Found trade group for base_id '", base_id_for_prefix, "' at index ", groupIndex,
-                      ". NT Symbol: '", nt_instrument_symbol_for_ac, "', NT Account: '", nt_account_name_for_ac, "'");
+            // 2. If not found in parallel arrays, try to extract base_id from the closed position's comment (fallback for older positions or recovery)
+            if (!details_found_from_parallel_arrays && closed_position_comment != "") {
+                notify_base_id = ExtractBaseIdFromComment(closed_position_comment);
+                if (notify_base_id != "") {
+                    Print("DEBUG_HEDGE_CLOSURE: Details not found in parallel arrays. Successfully extracted notify_base_id='", notify_base_id, "' from closed position comment '", closed_position_comment, "' as fallback.");
+                    // We don't have the stored MT5 action in this fallback case, it remains "unknown".
+                    // NT Symbol/Account also remain UNKNOWN unless we parse comment further (which ExtractBaseIdFromComment doesn't do).
+                } else {
+                    Print("DEBUG_HEDGE_CLOSURE: Details not found in parallel arrays. Failed to extract notify_base_id from closed position comment '", closed_position_comment, "' as fallback.");
+                }
+            } else if (!details_found_from_parallel_arrays && closed_position_comment == "") {
+                 Print("DEBUG_HEDGE_CLOSURE: Details not found in parallel arrays and closed position comment is empty. Cannot determine notify_base_id.");
+            }
+            
+            // --- COLLECT CLOSURE DATA FOR BATCH PROCESSING ---
+            // Instead of immediately processing and modifying arrays, collect all closure data first
+            int closure_index = ArraySize(g_pending_closures);
+            ArrayResize(g_pending_closures, closure_index + 1);
+            
+            g_pending_closures[closure_index].position_id = closing_deal_position_id;
+            g_pending_closures[closure_index].deal_ticket = current_deal_ticket_for_notification;
+            g_pending_closures[closure_index].deal_volume = notification_deal_volume;
+            g_pending_closures[closure_index].base_id = notify_base_id;
+            g_pending_closures[closure_index].nt_symbol = notify_nt_symbol;
+            g_pending_closures[closure_index].nt_account = notify_nt_account;
+            g_pending_closures[closure_index].mt5_action = stored_mt5_action;
+            g_pending_closures[closure_index].array_index = removal_index;
+            g_pending_closures[closure_index].found_in_arrays = details_found_from_parallel_arrays;
+            
+            PrintFormat("BATCH_PROCESSING: Collected closure data[%d] for PosID %I64u - BaseID='%s', Action='%s', ArrayIndex=%d",
+                       closure_index, closing_deal_position_id, notify_base_id, stored_mt5_action, removal_index);
+            
+            // --- PROCESS ALL PENDING CLOSURES ATOMICALLY ---
+            // This prevents array index invalidation during iteration
+            ProcessPendingClosuresBatch();
+            
+            return; // Skip the old immediate processing logic below
+
+            // Use the stored MT5 action if found, otherwise use the default "unknown"
+            notification_hedge_action = stored_mt5_action;
+            Print("DEBUG_HEDGE_CLOSURE: Final notification_hedge_action determined as: '", notification_hedge_action, "'");
+
+            // --- Actual Notification Sending & State Update ---
+            // notify_base_id is now populated from the best available source (parallel arrays or comment fallback)
+            // notify_nt_symbol and notify_nt_account are populated if found via parallel arrays, otherwise "UNKNOWN..."
+            // notification_hedge_action is populated from parallel arrays if found, otherwise "unknown"
+
+            // Increment MT5 hedges closed count for this base_id's group
+            int groupIdxClosed = -1;
+            if (notify_base_id != "") { // Only if we have a base_id to look up the group
+                for(int k = 0; k < ArraySize(g_baseIds); k++) {
+                    if(g_baseIds[k] == notify_base_id) {
+                        groupIdxClosed = k;
+                        break;
+                    }
+                }
+                if(groupIdxClosed != -1 && groupIdxClosed < ArraySize(g_mt5HedgesClosedCount)) {
+                    g_mt5HedgesClosedCount[groupIdxClosed]++;
+                    Print("ACHM_DIAG: [OnTradeTransaction] Incremented g_mt5HedgesClosedCount for base_id '", notify_base_id, "' (index ", groupIdxClosed, ") to ", g_mt5HedgesClosedCount[groupIdxClosed]);
+
+                    // ---- GROUP REMOVAL LOGIC ----
+                    bool nt_fills_are_complete = (groupIdxClosed < ArraySize(g_isComplete)) ? g_isComplete[groupIdxClosed] : false;
+                    int opened_count_for_group = (groupIdxClosed < ArraySize(g_mt5HedgesOpenedCount)) ? g_mt5HedgesOpenedCount[groupIdxClosed] : 0;
+                    bool mt5_hedges_opened_for_group = (opened_count_for_group > 0);
+                    int closed_count_for_group = g_mt5HedgesClosedCount[groupIdxClosed]; // Already incremented
+                    bool all_mt5_hedges_are_closed = (closed_count_for_group >= opened_count_for_group);
+
+                    Print("ACHM_DIAG: [OnTradeTransaction] Reconciliation check for base_id '", notify_base_id, "' (index ", groupIdxClosed, "): NT_Complete=", nt_fills_are_complete,
+                          ", MT5_Opened_Exist=", mt5_hedges_opened_for_group, ", MT5_All_Closed=", all_mt5_hedges_are_closed,
+                          ", ExpectedOpenedCount=", opened_count_for_group,
+                          ", ActualClosedCount=", closed_count_for_group);
+
+                    if (nt_fills_are_complete && mt5_hedges_opened_for_group && all_mt5_hedges_are_closed) {
+                        Print("ACHM_LOG: [OnTradeTransaction] Trade group '", notify_base_id, "' (index ", groupIdxClosed, ") is fully reconciled. Removing.");
+                        FinalizeAndRemoveTradeGroup(groupIdxClosed);
+                    } else {
+                         Print("ACHM_DIAG: [OnTradeTransaction] Trade group '", notify_base_id, "' (index ", groupIdxClosed, ") NOT yet fully reconciled.");
+                    }
+                } else if (notify_base_id != "") { // Has base_id, but group not found
+                    Print("ACHM_DIAG: [OnTradeTransaction] WARNING - Could not find group for base_id '", notify_base_id, "' to increment g_mt5HedgesClosedCount or perform reconciliation.");
+                }
+            }
+
+            string closure_reason = "UNKNOWN_MT5_CLOSE"; // Default
+            // Determine a more specific closure reason based on how we found the base_id and if the group was reconciled
+            if (notify_base_id != "") {
+                 if (groupIdxClosed != -1) { // Group was found for the notify_base_id
+                     bool is_nt_complete_for_group = (groupIdxClosed < ArraySize(g_isComplete) && g_isComplete[groupIdxClosed]);
+                     bool all_mt5_closed_for_group = (groupIdxClosed < ArraySize(g_mt5HedgesOpenedCount) && g_mt5HedgesClosedCount[groupIdxClosed] >= g_mt5HedgesOpenedCount[groupIdxClosed]);
+                     if (is_nt_complete_for_group && all_mt5_closed_for_group) {
+                         closure_reason = "EA_RECONCILED_AND_CLOSED";
+                     } else if (details_found_from_parallel_arrays) {
+                         closure_reason = "EA_PARALLEL_ARRAY_CLOSE";
+                     } else if (closed_position_comment != "" && ExtractBaseIdFromComment(closed_position_comment) == notify_base_id){
+                         closure_reason = "EA_COMMENT_BASED_CLOSE";
+                     }
+                } else if (details_found_from_parallel_arrays) { // Base_id from parallel arrays but no group (should be rare if group logic is sound)
+                    closure_reason = "EA_PARALLEL_ARRAY_ORPHAN_CLOSE";
+                } else if (closed_position_comment != "" && ExtractBaseIdFromComment(closed_position_comment) == notify_base_id){ // Base_id from comment, but no group
+                     closure_reason = "EA_COMMENT_ORPHAN_CLOSE";
+                } else if (CheckPointer(g_map_position_id_to_base_id) == POINTER_DYNAMIC) { // Check if old map was the source
+                    CString *temp_check_ptr = NULL;
+                    if(g_map_position_id_to_base_id.TryGetValue((long)closing_deal_position_id, temp_check_ptr) && temp_check_ptr != NULL && temp_check_ptr.Str() == notify_base_id) {
+                        closure_reason = "EA_OLD_MAP_FALLBACK_CLOSE";
+                    }
+                }
+            }
+            Print("ACHM_DIAG: [OnTradeTransaction] Determined closure_reason: '", closure_reason, "' for notify_base_id: '", notify_base_id, "'");
+
+
+            if (notify_base_id != "" && notification_hedge_action != "unknown" && notification_deal_volume > 0) {
+                Print("DEBUG_HEDGE_CLOSURE: Sending hedge close notification for base_id: ", notify_base_id,
+                      ", NT Symbol: ", notify_nt_symbol, ", NT Account: ", notify_nt_account,
+                      ", Closed Vol: ", notification_deal_volume, ", Closed Action: ", notification_hedge_action,
+                      ", Reason: ", closure_reason);
+                SendHedgeCloseNotification(notify_base_id, notify_nt_symbol, notify_nt_account, notification_deal_volume, notification_hedge_action, TimeCurrent(), closure_reason);
+                PrintFormat("DEBUG_HEDGE_CLOSURE: Successfully sent hedge close notification for PosID %d. BaseID: %s. Reason: %s", (long)closing_deal_position_id, notify_base_id, closure_reason);
+
+                if(removal_index != -1) { // If found and removed from parallel arrays
+                    RemoveFromOpenMT5Arrays(removal_index);
+                    Print("ACHM_DIAG: [OnTradeTransaction] Called RemoveFromOpenMT5Arrays for index ", removal_index, " (PosID ", (long)closing_deal_position_id, ")");
+                }
                 
-                // Send notification (existing logic can be adapted or used if SendHedgeCloseNotification is suitable)
-                string notification_message = "Hedge position for " + base_id_for_prefix +
-                                              " (" + nt_instrument_symbol_for_ac + ", " + nt_account_name_for_ac + ")" +
-                                              " on MT5 PositionID " + (string)closing_deal_position_id + " has been closed.";
-                Print(notification_message);
-
-                if(nt_instrument_symbol_for_ac == "" || nt_account_name_for_ac == "") {
-                     Print("ERROR: Could not find TradeGroup details (NT Symbol/Account) for base_id '", base_id_for_prefix, "' for AC Adjustment. Skipping HandleACAdjustmentOnHedgeClosure.");
-                } else {
-                    // Declare variables for closing deal details that were previously undeclared.
-                    // These are needed to fetch information about the deal that closed the hedge position.
-                    ulong  closing_deal_ticket;
-                    double closing_deal_volume;
-                    double closing_deal_price;
-
-                    // Obtain the deal ticket from the 'trans' object (type MqlTradeTransaction),
-                    // which is assumed to be an argument to the OnTradeTransaction event handler.
-                    // The 'trans.deal' property provides the ticket of the deal associated with this transaction.
-                    closing_deal_ticket = trans.deal; // 'trans' is the MqlTradeTransaction object
-
-                    // Proceed only if a valid deal ticket was obtained from the transaction.
-                    if(closing_deal_ticket > 0 && HistoryDealSelect(closing_deal_ticket)) {
-                        // Assign values to the now-declared variables
-                        closing_deal_volume = HistoryDealGetDouble(closing_deal_ticket, DEAL_VOLUME);
-                        closing_deal_price = HistoryDealGetDouble(closing_deal_ticket, DEAL_PRICE); // Price is still useful for logging or other logic
-                        double deal_pnl = HistoryDealGetDouble(closing_deal_ticket, DEAL_PROFIT);
-                        
-                        if(UseACRiskManagement)
-                        {
-                           HandleACAdjustmentOnHedgeClosure(base_id_for_prefix, closing_deal_volume, deal_pnl); // Pass actual PnL
-                           Print("DEBUG_HEDGE_CLOSURE: Called HandleACAdjustmentOnHedgeClosure for PositionID ", closing_deal_position_id, " with PnL: ", deal_pnl);
-                        }
-                    } else {
-                        // Log an error if the deal ticket is invalid or the deal cannot be selected.
-                        if (closing_deal_ticket == 0) {
-                             PrintFormat("ERROR: Failed to get a valid closing_deal_ticket from transaction for PositionID %s, base_id '%s'. AC adjustment cannot proceed.", (string)closing_deal_position_id, base_id_for_prefix);
+                // Clean up old map if this PosID was the source of the base_id AND it was from the old map
+                if (closure_reason == "EA_OLD_MAP_FALLBACK_CLOSE" && CheckPointer(g_map_position_id_to_base_id) == POINTER_DYNAMIC) {
+                    CString *removed_val = NULL;
+                    // TryGetValue again to get the pointer for deletion, then Remove.
+                    if(g_map_position_id_to_base_id.TryGetValue((long)closing_deal_position_id, removed_val)){
+                        if(g_map_position_id_to_base_id.Remove((long)closing_deal_position_id)){
+                            Print("DEBUG_HEDGE_CLOSURE: Removed PosID ", (long)closing_deal_position_id, " from OLD map after using it for fallback notification.");
+                            if(CheckPointer(removed_val) == POINTER_DYNAMIC) delete removed_val;
                         } else {
-                             PrintFormat("ERROR: Could not select closing deal #%s (for PositionID: %s, base_id: '%s') to get volume/price for AC adjustment. Error code: %d",
-                                        (string)closing_deal_ticket, (string)closing_deal_position_id, base_id_for_prefix, GetLastError());
+                            Print("DEBUG_HEDGE_CLOSURE: Failed to remove PosID ", (long)closing_deal_position_id, " from OLD map even after TryGetValue succeeded.");
                         }
                     }
                 }
-                // Mark the trade group as complete
-                g_isComplete[groupIndex] = true;
-                Print("DEBUG_HEDGE_CLOSURE: Marked trade group at index ", groupIndex, " (base_id: ", base_id_for_prefix, ") as complete.");
+            } else { // notify_base_id is empty OR other details missing for notification
+                PrintFormat("DEBUG_HEDGE_CLOSURE: ERROR - Cannot send notification for PosID %d. notify_base_id='%s', deal_volume=%f, hedge_action='%s'.", (long)closing_deal_position_id, notify_base_id, notification_deal_volume, notification_hedge_action);
+                // Orphan logic below might still attempt globalFutures adjustment if comment is parsable
             }
-            else
-            {
-                Print("DEBUG_HEDGE_CLOSURE: Could not find active trade group for base_id '", base_id_for_prefix, "' (from PositionID ", closing_deal_position_id, "). Cannot complete AC adjustment or mark group complete.");
+            // --- END HEDGE CLOSURE NOTIFICATION LOGIC ---
+ 
+            // --- AC ADJUSTMENT LOGIC (uses base_id_for_prefix which should be same as notify_base_id if found) ---
+            // Note: base_id_for_prefix is now populated from the same logic as notify_base_id
+            string base_id_for_ac_adj = notify_base_id; // Use the same base_id found for notification
+
+            if(base_id_for_ac_adj != "") {
+                int groupIndexAC = -1;
+                for(int i = 0; i < ArraySize(g_baseIds); i++) {
+                    if(g_baseIds[i] == base_id_for_ac_adj) { // Check if group still exists
+                        groupIndexAC = i;
+                        break;
+                    }
+                }
+
+                if(groupIndexAC != -1) { // Group for base_id_for_ac_adj exists
+                    string nt_instr_ac = (groupIndexAC < ArraySize(g_ntInstrumentSymbols)) ? g_ntInstrumentSymbols[groupIndexAC] : "";
+                    string nt_acc_ac = (groupIndexAC < ArraySize(g_ntAccountNames)) ? g_ntAccountNames[groupIndexAC] : "";
+                    Print("DEBUG_HEDGE_CLOSURE: Found trade group for AC base_id '", base_id_for_ac_adj, "' at index ", groupIndexAC);
+
+                    if(HistoryDealSelect(trans.deal)) {
+                        double deal_vol_ac = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+                        double deal_pnl_ac = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+                        if(UseACRiskManagement) {
+                           HandleACAdjustmentOnHedgeClosure(base_id_for_ac_adj, deal_vol_ac, deal_pnl_ac);
+                           Print("DEBUG_HEDGE_CLOSURE: Called HandleACAdjustmentOnHedgeClosure for PosID ", closing_deal_position_id, " (base_id '", base_id_for_ac_adj, "') with PnL: ", deal_pnl_ac);
+                        }
+                        // Mark the trade group (found by base_id_for_ac_adj) as complete if it's not already.
+                        // This part is a bit redundant if the new reconciliation logic already handled it via notify_base_id.
+                        // However, base_id_for_ac_adj might be from a very old position not in parallel arrays.
+                        if (groupIndexAC < ArraySize(g_isComplete) && !g_isComplete[groupIndexAC]) {
+                             g_isComplete[groupIndexAC] = true;
+                             Print("DEBUG_HEDGE_CLOSURE: Marked trade group (for AC) at index ", groupIndexAC, " (base_id: ", base_id_for_ac_adj, ") as complete.");
+                        }
+                    } else {
+                        Print("ERROR: Could not select closing deal #", trans.deal, " for AC adjustment for base_id '", base_id_for_ac_adj, "'");
+                    }
+                } else {
+                    Print("DEBUG_HEDGE_CLOSURE: No trade group found for AC base_id '", base_id_for_ac_adj, "'. Skipping AC adjustment.");
+                }
             }
+            // --- END AC ADJUSTMENT LOGIC ---
+
+        } else { // Position is NOT fully closed by this deal
+             Print("DEBUG_HEDGE_CLOSURE: Position #", closing_deal_position_id, " was affected by deal ", deal_ticket, " but is NOT fully closed. Volume remaining: ", (posInfo.SelectByTicket(closing_deal_position_id) ? posInfo.Volume() : -1.0), ". No full closure processing.");
         }
         // If !is_position_closed, the deal was a partial close or the position is still open for other reasons.
-        // No specific action for this case based on the prompt's focus on full closure.
-    }
-    else
+
+        // --- FALLBACK FOR ORPHANED HEDGES (if notify_base_id is still empty after all attempts) ---
+        // This block is now only for globalFutures adjustment if no base_id was found for notification/AC logic.
+        // The notification logic above is the primary path.
+        if(is_position_closed && notify_base_id == "") { // Check if position is closed AND we failed to find base_id via primary methods
+            Print("ACHM_ORPHAN: Position ", closing_deal_position_id, " closed, but notify_base_id is empty. Attempting fallback globalFutures adjustment from position/order comment.");
+            
+            string comment_for_orphan_parsing = closed_position_comment; // From earlier CPositionInfo attempt
+            if (comment_for_orphan_parsing == "") { // If CPositionInfo failed to get it
+                 ulong order_ticket_for_closing_deal = HistoryDealGetInteger(deal_ticket, DEAL_ORDER);
+                 if(order_ticket_for_closing_deal > 0 && HistoryOrderSelect(order_ticket_for_closing_deal)){ // Check if order_ticket is valid
+                     comment_for_orphan_parsing = HistoryOrderGetString(order_ticket_for_closing_deal, ORDER_COMMENT);
+                     Print("ACHM_ORPHAN: Using comment from closing order ", order_ticket_for_closing_deal, ": '", comment_for_orphan_parsing, "'");
+                 }
+            }
+            // string notify_base_id; // Removed redundant local declaration, outer scope variable will be used.
+
+            if(comment_for_orphan_parsing != "") {
+                string fb_base_id_str = ExtractBaseIdFromComment(comment_for_orphan_parsing); // Use enhanced extractor
+                string fb_nt_action_str = "";
+                int fb_nt_qty_val = 0;
+                string fb_mt5_action_str = "";
+
+                string fallback_parts[];
+                int fallback_num_parts = StringSplit(comment_for_orphan_parsing, ';', fallback_parts);
+
+                if(fallback_num_parts > 0 && fallback_parts[0] == "AC_HEDGE") {
+                    // Attempt to parse NTA, NTQ, MTA if available
+                    if (fallback_num_parts > 2 && StringFind(fallback_parts[2], "NTA:", 0) == 0) {
+                        string nta_part[]; StringSplit(fallback_parts[2], ':', nta_part);
+                        if(ArraySize(nta_part) == 2) fb_nt_action_str = nta_part[1];
+                    }
+                    if (fallback_num_parts > 3 && StringFind(fallback_parts[3], "NTQ:", 0) == 0) {
+                        string ntq_part[]; StringSplit(fallback_parts[3], ':', ntq_part);
+                        if(ArraySize(ntq_part) == 2) fb_nt_qty_val = (int)StringToInteger(ntq_part[1]);
+                    }
+                    if (fallback_num_parts > 4 && StringFind(fallback_parts[4], "MTA:", 0) == 0) {
+                        string mta_part[]; StringSplit(fallback_parts[4], ':', mta_part);
+                        if(ArraySize(mta_part) == 2) fb_mt5_action_str = mta_part[1];
+                    }
+                } else {
+                    Print("ACHM_ORPHAN_WARN: Fallback comment '", comment_for_orphan_parsing, "' does not start with AC_HEDGE. Cannot reliably parse NTA/NTQ/MTA.");
+                }
+
+                // We need at least the MT5 action and NT quantity for globalFutures adjustment.
+                // Base ID and NT Action are good for logging/completeness.
+                if(fb_mt5_action_str != "" && fb_nt_qty_val > 0) { // fb_base_id_str and fb_nt_action_str are optional for this specific adjustment
+                    Print("ACHM_ORPHAN: Parsed from orphan comment '", comment_for_orphan_parsing, "': BaseID='", fb_base_id_str, "', Orig_NT_Action='", fb_nt_action_str, "', Orig_NT_Qty=", fb_nt_qty_val, ", MT5_Hedge_Action='", fb_mt5_action_str, "'");
+                    
+                    double adjustment = 0;
+                    if (fb_mt5_action_str == "Buy") { // MT5 Buy hedge closed (was hedging NT Sell)
+                        adjustment = fb_nt_qty_val; // globalFutures should increase (become less negative or more positive)
+                        globalFutures += adjustment;
+                        Print("ACHM_ORPHAN: Closed MT5 BUY hedge (was for NT SELL). globalFutures adjusted by +", adjustment, ". New globalFutures: ", globalFutures);
+                    } else if (fb_mt5_action_str == "Sell") { // MT5 Sell hedge closed (was hedging NT Buy)
+                        adjustment = -fb_nt_qty_val; // globalFutures should decrease (become less positive or more negative)
+                        globalFutures += adjustment;
+                        Print("ACHM_ORPHAN: Closed MT5 SELL hedge (was for NT BUY). globalFutures adjusted by ", adjustment, ". New globalFutures: ", globalFutures);
+                    } else {
+                         Print("ACHM_ORPHAN_WARN: Parsed MT5 action '", fb_mt5_action_str, "' is not Buy/Sell. No globalFutures adjustment from orphan logic.");
+                    }
+                } else {
+                    Print("ACHM_ORPHAN_WARN: Could not parse essential components (MT5_Action, NT_Qty) from orphan comment '", comment_for_orphan_parsing, "'. No globalFutures adjustment. MTA='", fb_mt5_action_str, "', NTQ=", fb_nt_qty_val);
+                }
+            } else {
+                 Print("ACHM_ORPHAN_WARN: Could not retrieve any comment for fallback adjustment for closed position related to deal ", deal_ticket, " (PosID: ", closing_deal_position_id, ")");
+            }
+        }
+    } // End of if(deal_entry == DEAL_ENTRY_OUT || deal_entry == DEAL_ENTRY_INOUT)
+    else // Deal is not a closing type
     {
         Print("DEBUG_HEDGE_CLOSURE: Deal ", deal_ticket, " (Entry: ", EnumToString(deal_entry),
-              ") is not a closing type (DEAL_ENTRY_OUT or DEAL_ENTRY_INOUT). Skipping hedge closure notification logic.");
+              ") is not a closing type (DEAL_ENTRY_OUT or DEAL_ENTRY_INOUT). Skipping hedge closure notification logic and orphan fallback.");
     }
 }
 

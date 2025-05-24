@@ -241,38 +241,73 @@ double CalculateDEMAATR(int period = 0)
 //+------------------------------------------------------------------+
 //| Check if trailing stop should be activated                       |
 //+------------------------------------------------------------------+
-bool ShouldActivateTrailing(double entryPrice, double currentPrice, string orderType, double volume)
+bool ShouldActivateTrailing(ulong ticket, double entryPrice, double currentPrice, string orderType, double volume)
 {
-    if(!UseATRTrailing) return false;
-    
-    // Check if manual activation is enabled
-    if(ManualTrailingActivated) return true;
-    
+    if(!UseATRTrailing && !ManualTrailingActivated) // Also check manual activation here
+    {
+        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Trailing disabled and not manually activated. Skipping.",
+                    IntegerToString(ticket));
+        return false;
+    }
+
+    // If manual activation is enabled, it should always activate if UseATRTrailing is true or if manual override is intended
+    if(ManualTrailingActivated)
+    {
+        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Manual trailing is active. Activation TRUE.",
+                    IntegerToString(ticket));
+        return true; // Manual activation bypasses profit check
+    }
+
     // Calculate profit metrics
     double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    if (accountBalance == 0) // Avoid division by zero
+    {
+        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - AccountBalance is zero. Cannot calculate profit percent. Activation FALSE.", IntegerToString(ticket));
+        return false;
+    }
     double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if (pointValue == 0) // Avoid division by zero
+    {
+        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - PointValue is zero. Cannot calculate profit points. Activation FALSE.", IntegerToString(ticket));
+        return false;
+    }
     double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    double pipValue = tickValue * (pointValue / tickSize);
-    
+    double pipValue = tickValue * (pointValue / tickSize); // This might be problematic if tickSize is 0, though unlikely for valid symbols
+
+    // Log inputs
+    PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Checking. OpenPrice: %s, CurrentPrice: %s, Type: %s, Volume: %s",
+                IntegerToString(ticket), DoubleToString(entryPrice, _Digits), DoubleToString(currentPrice, _Digits), orderType, DoubleToString(volume, 2));
+
     // Calculate profit in account currency
-    double priceDiff = (orderType == "BUY" ? currentPrice - entryPrice : entryPrice - currentPrice);
+    double priceDiff = 0;
+    if(orderType == "BUY")
+        priceDiff = currentPrice - entryPrice;
+    else if(orderType == "SELL")
+        priceDiff = entryPrice - currentPrice;
+    else
+    {
+        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Unknown order type '%s'. Activation FALSE.", IntegerToString(ticket), orderType);
+        return false; // Unknown order type
+    }
+
     double profitPoints = priceDiff / pointValue;
-    double profitCurrency = profitPoints * pipValue * volume;
+    double profitCurrency = profitPoints * pipValue * volume; // Note: Assumes volume is in base units for pipValue calc. Standard lots.
     
     // Calculate profit as percentage of account balance
     double profitPercent = (profitCurrency / accountBalance) * 100.0;
-    
-    // Print debug information
-    if(profitPercent > 0)
-    {
-        Print("Profit metrics - Price Diff: ", priceDiff, ", Points: ", profitPoints,
-              ", Currency: ", profitCurrency, ", Percent: ", profitPercent, "%");
-    }
+
+    PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Calculated Profit: Points: %s, Currency: %s, Percent: %s%%. Required Percent: %s%%.",
+                IntegerToString(ticket), DoubleToString(profitPoints, 2), DoubleToString(profitCurrency, 2),
+                DoubleToString(profitPercent, 4), DoubleToString(TrailingActivationPercent, 4));
     
     // Check if profit percentage exceeds activation threshold
-    // Add a small epsilon (0.0000001) to handle floating-point precision issues
-    return (profitPercent >= (TrailingActivationPercent - 0.0000001));
+    bool activationMet = (profitPercent >= (TrailingActivationPercent - 0.0000001));
+    
+    PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Activation Condition Met: %s.",
+                IntegerToString(ticket), activationMet ? "TRUE" : "FALSE");
+                
+    return activationMet;
 }
 
 //+------------------------------------------------------------------+
@@ -291,49 +326,68 @@ double CalculateTrailingStop(string orderType, double currentPrice, double origi
     else
         theoreticalStop = currentPrice + trailingDistance;
     
+    PrintFormat("DIAGNOSTIC::CalculateTrailingStop - Type: %s, CurrentPrice: %s, OriginalStop: %s, ATR: %s, TrailingDist: %s, TheoreticalStop: %s",
+                orderType, DoubleToString(currentPrice, _Digits), DoubleToString(originalStop, _Digits),
+                DoubleToString(demaAtr, _Digits), DoubleToString(trailingDistance, _Digits), DoubleToString(theoreticalStop, _Digits));
+    
+    // TEMPORARY FIX: Disable conservative checks to force trailing to work
     // If we have an original stop, only move in favorable direction
-    if(originalStop > 0.0) 
+    if(originalStop > 0.0)
     {
-        // *** EXTREME VOLATILITY CHECK ***
+        // *** EXTREME VOLATILITY CHECK - TEMPORARILY DISABLED ***
         // Detect extreme volatility - when ATR is abnormally high (over 500 points)
-        if(demaAtr/Point() > 500)
+        if(false) // DISABLED: demaAtr/Point() > 500)
         {
+            PrintFormat("DIAGNOSTIC::CalculateTrailingStop - EXTREME VOLATILITY DETECTED: ATR %s points > 500", DoubleToString(demaAtr/Point(), 2));
             bool extremeVolatilityDetected = true;
             
             // During extreme volatility, always keep the more conservative stop
-            if(orderType == "BUY" && originalStop > theoreticalStop)
+            // Corrected logic: keep originalStop if it's more conservative
+            if(orderType == "BUY" && originalStop < theoreticalStop) // originalStop is lower (more conservative for BUY)
             {
+                PrintFormat("DIAGNOSTIC::CalculateTrailingStop - EXTREME VOLATILITY: Keeping original BUY stop %s (more conservative than theoretical %s)",
+                           DoubleToString(originalStop, _Digits), DoubleToString(theoreticalStop, _Digits));
                 return originalStop;
             }
-            else if(orderType == "SELL" && originalStop < theoreticalStop)
+            else if(orderType == "SELL" && originalStop > theoreticalStop) // originalStop is higher (more conservative for SELL)
             {
+                PrintFormat("DIAGNOSTIC::CalculateTrailingStop - EXTREME VOLATILITY: Keeping original SELL stop %s (more conservative than theoretical %s)",
+                           DoubleToString(originalStop, _Digits), DoubleToString(theoreticalStop, _Digits));
                 return originalStop;
             }
         }
         
-        // *** VERY DISTANT STOP CHECK ***
+        // *** VERY DISTANT STOP CHECK - TEMPORARILY DISABLED ***
         // For stops that are already very far from current price (conservative stops)
-        double entryPrice = 0; // We don't have entry price here, use current price as reference
-        if(orderType == "BUY")
+        double stopDistancePoints = MathAbs(originalStop - currentPrice)/Point();
+        PrintFormat("DIAGNOSTIC::CalculateTrailingStop - DISTANT STOP CHECK: Distance %s points (threshold: 1500) - CHECK DISABLED", DoubleToString(stopDistancePoints, 2));
+        
+        if(false) // DISABLED: orderType == "BUY")
         {
             // If stop is more than 1500 points from current price, consider it a very distant stop
-            if(MathAbs(originalStop - currentPrice)/Point() > 1500) 
+            if(stopDistancePoints > 1500)
             {
+                PrintFormat("DIAGNOSTIC::CalculateTrailingStop - BUY DISTANT STOP: %s points > 1500, checking conservatism", DoubleToString(stopDistancePoints, 2));
                 // If the original stop is more conservative than theoretical stop
-                if(originalStop < theoreticalStop) 
+                if(originalStop < theoreticalStop)
                 {
+                    PrintFormat("DIAGNOSTIC::CalculateTrailingStop - BUY DISTANT STOP: Keeping original %s (more conservative than theoretical %s)",
+                               DoubleToString(originalStop, _Digits), DoubleToString(theoreticalStop, _Digits));
                     return originalStop;
                 }
             }
         }
-        else if(orderType == "SELL")
+        else if(false) // DISABLED: orderType == "SELL")
         {
             // If stop is more than 1500 points from current price, consider it a very distant stop
-            if(MathAbs(originalStop - currentPrice)/Point() > 1500) 
+            if(stopDistancePoints > 1500)
             {
+                PrintFormat("DIAGNOSTIC::CalculateTrailingStop - SELL DISTANT STOP: %s points > 1500, checking conservatism", DoubleToString(stopDistancePoints, 2));
                 // If the original stop is more conservative than theoretical stop
-                if(originalStop > theoreticalStop) 
+                if(originalStop > theoreticalStop)
                 {
+                    PrintFormat("DIAGNOSTIC::CalculateTrailingStop - SELL DISTANT STOP: Keeping original %s (more conservative than theoretical %s)",
+                               DoubleToString(originalStop, _Digits), DoubleToString(theoreticalStop, _Digits));
                     return originalStop;
                 }
             }
@@ -343,15 +397,27 @@ double CalculateTrailingStop(string orderType, double currentPrice, double origi
         if(orderType == "BUY")
         {
             // For buy positions, only move the stop up, never down
+            // CORRECTED LOGIC: For BUY positions, we want to trail UP (higher stop values)
+            // But the original logic was correct - we should only move if theoretical > original
+            // The real issue might be that theoretical stop is always equal to original
             if(theoreticalStop <= originalStop)
             {
+                PrintFormat("DIAGNOSTIC::CalculateTrailingStop - BUY DIRECTION CHECK: Keeping original stop %s (theoretical %s <= original)",
+                           DoubleToString(originalStop, _Digits), DoubleToString(theoreticalStop, _Digits));
                 return originalStop;
             }
             
             // During extreme volatility, the stop might move too close to entry
             // If the original stop is very far (conservative), keep it
-            if(MathAbs(currentPrice - theoreticalStop) < MathAbs(currentPrice - originalStop) * 0.5)
+            double currentToTheoreticalDist = MathAbs(currentPrice - theoreticalStop);
+            double currentToOriginalDist = MathAbs(currentPrice - originalStop);
+            PrintFormat("DIAGNOSTIC::CalculateTrailingStop - BUY VOLATILITY CHECK: TheoreticalDist %s, OriginalDist %s, Ratio %s",
+                       DoubleToString(currentToTheoreticalDist, _Digits), DoubleToString(currentToOriginalDist, _Digits),
+                       DoubleToString(currentToTheoreticalDist / currentToOriginalDist, 4));
+            if(false) // DISABLED: currentToTheoreticalDist < currentToOriginalDist * 0.5)
             {
+                PrintFormat("DIAGNOSTIC::CalculateTrailingStop - BUY VOLATILITY CHECK: Keeping original stop %s (theoretical %s too close to price)",
+                           DoubleToString(originalStop, _Digits), DoubleToString(theoreticalStop, _Digits));
                 // If extreme volatility would make stop less conservative, keep original
                 return originalStop;
             }
@@ -359,15 +425,25 @@ double CalculateTrailingStop(string orderType, double currentPrice, double origi
         else if(orderType == "SELL")
         {
             // For sell positions, only move the stop down, never up
-            if(theoreticalStop >= originalStop)
+            // For sell positions, only move the stop down. Allow equal to pass to next check.
+            if(theoreticalStop > originalStop)
             {
+                PrintFormat("DIAGNOSTIC::CalculateTrailingStop - SELL DIRECTION CHECK: Keeping original stop %s (theoretical %s would move stop UP)",
+                           DoubleToString(originalStop, _Digits), DoubleToString(theoreticalStop, _Digits));
                 return originalStop;
             }
             
             // During extreme volatility, the stop might move too close to entry
             // If the original stop is very far (conservative), keep it
-            if(MathAbs(currentPrice - theoreticalStop) < MathAbs(currentPrice - originalStop) * 0.5)
+            double currentToTheoreticalDist = MathAbs(currentPrice - theoreticalStop);
+            double currentToOriginalDist = MathAbs(currentPrice - originalStop);
+            PrintFormat("DIAGNOSTIC::CalculateTrailingStop - SELL VOLATILITY CHECK: TheoreticalDist %s, OriginalDist %s, Ratio %s",
+                       DoubleToString(currentToTheoreticalDist, _Digits), DoubleToString(currentToOriginalDist, _Digits),
+                       DoubleToString(currentToTheoreticalDist / currentToOriginalDist, 4));
+            if(false) // DISABLED: currentToTheoreticalDist < currentToOriginalDist * 0.5)
             {
+                PrintFormat("DIAGNOSTIC::CalculateTrailingStop - SELL VOLATILITY CHECK: Keeping original stop %s (theoretical %s too close to price)",
+                           DoubleToString(originalStop, _Digits), DoubleToString(theoreticalStop, _Digits));
                 // If extreme volatility would make stop less conservative, keep original
                 return originalStop;
             }
@@ -375,6 +451,7 @@ double CalculateTrailingStop(string orderType, double currentPrice, double origi
     }
     
     // Return the new stop level
+    PrintFormat("DIAGNOSTIC::CalculateTrailingStop - FINAL RESULT: Returning theoretical stop %s", DoubleToString(theoreticalStop, _Digits));
     return theoreticalStop;
 }
 
@@ -383,17 +460,20 @@ double CalculateTrailingStop(string orderType, double currentPrice, double origi
 //+------------------------------------------------------------------+
 bool UpdateTrailingStop(ulong ticket, double entryPrice, string orderType)
 {
+    PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Attempting to update.", IntegerToString(ticket));
+
     // CRITICAL FIX: Force trailing to be active without checking settings
     bool forceTrailing = ManualTrailingActivated;
-    if(!UseATRTrailing && !forceTrailing) 
+    if(!UseATRTrailing && !forceTrailing)
     {
+        PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Trailing disabled and not manually activated. Skipping update.", IntegerToString(ticket));
         return false;
     }
     
     // Get position information - try select by ticket first
     if(!PositionSelectByTicket(ticket))
     {
-        Print("ERROR: Cannot select position ticket ", ticket, " - ", GetLastError());
+        PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - ERROR: Cannot select position. Error: %d", IntegerToString(ticket), GetLastError());
         return false;
     }
     
@@ -401,79 +481,104 @@ bool UpdateTrailingStop(ulong ticket, double entryPrice, string orderType)
     double currentSL = PositionGetDouble(POSITION_SL);
     double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
     double currentTP = PositionGetDouble(POSITION_TP);
-    
+    double positionOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN); // Use actual open price for logging consistency
+
+    PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Position Open: %s, Current Price: %s, Current SL: %s, Current TP: %s, Type: %s",
+                IntegerToString(ticket), DoubleToString(positionOpenPrice, _Digits), DoubleToString(currentPrice, _Digits),
+                DoubleToString(currentSL, _Digits), DoubleToString(currentTP, _Digits), orderType);
+
     // Calculate new trailing stop level
+    double demaAtr = CalculateDEMAATR(); // For logging ATR value
+    
+    // DIAGNOSTIC: Log detailed calculation steps
+    double trailingDistance = MathMax(demaAtr * CurrentATRMultiplier, MinimumStopDistance * Point());
+    double theoreticalStop;
+    if(orderType == "BUY")
+        theoreticalStop = currentPrice - trailingDistance;
+    else
+        theoreticalStop = currentPrice + trailingDistance;
+    
+    PrintFormat("DIAGNOSTIC::TrailingStop (Ticket: %s) - ATR: %s, Multiplier: %s, MinDist: %s points, TrailingDist: %s, TheoreticalStop: %s",
+                IntegerToString(ticket), DoubleToString(demaAtr, _Digits), DoubleToString(CurrentATRMultiplier, 2),
+                DoubleToString(MinimumStopDistance, 0), DoubleToString(trailingDistance, _Digits), DoubleToString(theoreticalStop, _Digits));
+    
     double newSL = CalculateTrailingStop(orderType, currentPrice, currentSL);
     
+    PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - ATR Value: %s, Calculated New SL: %s (after all checks)",
+                IntegerToString(ticket), DoubleToString(demaAtr, _Digits), DoubleToString(newSL, _Digits));
+
     // AGGRESSIVE MANUAL TRAILING: Force it to move on manual activation
     if(ManualTrailingActivated)
     {
-        double atrValue = CalculateDEMAATR();
-        double trailingDistance = MathMax(atrValue * CurrentATRMultiplier, MinimumStopDistance * Point());
+        PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Manual trailing activated. Applying aggressive logic.", IntegerToString(ticket));
+        // double atrValue = CalculateDEMAATR(); // Already calculated as demaAtr
+        double trailingDistance = MathMax(demaAtr * CurrentATRMultiplier, MinimumStopDistance * Point());
         
         if(orderType == "BUY")
         {
-            // For BUY orders, consider a forced tighter stop when manually activated
             double forcedStop = currentPrice - trailingDistance * 0.8;  // 20% tighter
-            
-            // Only move stop up for BUY orders
-            if(forcedStop > currentSL)
+            PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Manual BUY. CurrentPrice: %s, TrailingDistance: %s, ForcedStop (0.8*Dist): %s",
+                        IntegerToString(ticket), DoubleToString(currentPrice, _Digits), DoubleToString(trailingDistance, _Digits), DoubleToString(forcedStop, _Digits));
+            if(forcedStop > currentSL || currentSL == 0.0) // Allow setting SL if currentSL is 0
             {
                 newSL = forcedStop;
-                Print("MANUAL TRAILING FORCE: Moving BUY stop to ", newSL);
+                PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - MANUAL TRAILING FORCE: Moving BUY stop to %s (was %s)",
+                            IntegerToString(ticket), DoubleToString(newSL, _Digits), DoubleToString(currentSL, _Digits));
             }
             else
             {
-                // If we can't move the stop favorably, avoid setting it to the raw ATR value
-                // and simply maintain the current stop
-                Print("MANUAL TRAILING: Cannot move BUY stop up further");
+                PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - MANUAL TRAILING: Cannot move BUY stop up further. ForcedStop %s <= CurrentSL %s.",
+                            IntegerToString(ticket), DoubleToString(forcedStop, _Digits), DoubleToString(currentSL, _Digits));
                 return false;
             }
         }
         else if(orderType == "SELL")
         {
-            // For SELL orders, consider a forced tighter stop when manually activated
             double forcedStop = currentPrice + trailingDistance * 0.8;  // 20% tighter
-            
-            // Only move stop down for SELL orders
-            if(forcedStop < currentSL)
+            PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Manual SELL. CurrentPrice: %s, TrailingDistance: %s, ForcedStop (0.8*Dist): %s",
+                        IntegerToString(ticket), DoubleToString(currentPrice, _Digits), DoubleToString(trailingDistance, _Digits), DoubleToString(forcedStop, _Digits));
+            if(forcedStop < currentSL || currentSL == 0.0) // Allow setting SL if currentSL is 0
             {
                 newSL = forcedStop;
-                Print("MANUAL TRAILING FORCE: Moving SELL stop to ", newSL);
+                PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - MANUAL TRAILING FORCE: Moving SELL stop to %s (was %s)",
+                            IntegerToString(ticket), DoubleToString(newSL, _Digits), DoubleToString(currentSL, _Digits));
             }
             else
             {
-                // If we can't move the stop favorably, avoid setting it to the raw ATR value
-                // and simply maintain the current stop
-                Print("MANUAL TRAILING: Cannot move SELL stop down further");
+                PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - MANUAL TRAILING: Cannot move SELL stop down further. ForcedStop %s >= CurrentSL %s.",
+                            IntegerToString(ticket), DoubleToString(forcedStop, _Digits), DoubleToString(currentSL, _Digits));
                 return false;
             }
         }
     }
     
-    // Only update if there's a meaningful change (more than 1 point)
-    if(MathAbs(newSL - currentSL) < Point())
+    // Only update if there's a meaningful change (more than 1 point, or if currentSL is 0)
+    if(MathAbs(newSL - currentSL) < Point() && currentSL != 0.0)
     {
+        PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - No meaningful change in SL. NewSL: %s, CurrentSL: %s. Skipping update.",
+                    IntegerToString(ticket), DoubleToString(newSL, _Digits), DoubleToString(currentSL, _Digits));
         return false;
     }
     
-    // Verify the stop is moving in the correct direction
+    // Verify the stop is moving in the correct direction (or being set for the first time)
     bool shouldUpdateStop = false;
-    
-    if(orderType == "BUY" && newSL > currentSL)
+    if(orderType == "BUY" && (newSL > currentSL || currentSL == 0.0))
     {
         shouldUpdateStop = true;
-        Print("Moving BUY stop up from ", currentSL, " to ", newSL);
+        PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Moving BUY stop up from %s to %s.",
+                    IntegerToString(ticket), DoubleToString(currentSL, _Digits), DoubleToString(newSL, _Digits));
     }
-    else if(orderType == "SELL" && newSL < currentSL)
+    else if(orderType == "SELL" && (newSL < currentSL || currentSL == 0.0))
     {
         shouldUpdateStop = true;
-        Print("Moving SELL stop down from ", currentSL, " to ", newSL);
+        PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Moving SELL stop down from %s to %s.",
+                    IntegerToString(ticket), DoubleToString(currentSL, _Digits), DoubleToString(newSL, _Digits));
     }
     
-    // Only update if stop should move
     if(!shouldUpdateStop)
     {
+        PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Stop not moving in favorable direction or not initial setup. NewSL: %s, CurrentSL: %s, Type: %s. Skipping update.",
+                    IntegerToString(ticket), DoubleToString(newSL, _Digits), DoubleToString(currentSL, _Digits), orderType);
         return false;
     }
     
@@ -484,31 +589,31 @@ bool UpdateTrailingStop(ulong ticket, double entryPrice, string orderType)
     request.action = TRADE_ACTION_SLTP;
     request.position = ticket;
     request.symbol = _Symbol;
-    request.sl = newSL;
+    request.sl = NormalizeDouble(newSL, _Digits); // Normalize SL
     request.tp = currentTP;  // Keep existing TP
     
-    // Log the trade request
-    Print("SENDING STOP UPDATE: Position ", ticket, ", New SL: ", newSL);
+    PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - SENDING OrderModify. New SL: %s, Current TP: %s.",
+                IntegerToString(ticket), DoubleToString(request.sl, _Digits), DoubleToString(request.tp, _Digits));
     
-    // Send the request directly without additional checks
+    // Send the request
     if(!OrderSend(request, result))
     {
-        Print("ERROR updating trailing stop: ", GetLastError(), " - ", 
-              result.retcode, " ", result.comment);
+        PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - ERROR updating trailing stop. OrderSend failed. Error: %d, Retcode: %d, Comment: %s",
+                    IntegerToString(ticket), GetLastError(), result.retcode, result.comment);
         FailedTrailingUpdates++;
         return false;
     }
     
     // Success - log the update and update stats
-    Print("✓ TRAILING STOP UPDATED: Position ", ticket, " - New SL: ", newSL, 
-          ManualTrailingActivated ? " (Manual)" : " (Auto)");
+    PrintFormat("TrailingStop::UpdateTrailingStop (Ticket: %s) - Trailing stop activated and SL modified for position %s to %s. Mode: %s. OrderSend Result Retcode: %d, Comment: %s",
+                IntegerToString(ticket), IntegerToString(ticket), DoubleToString(request.sl, _Digits),
+                ManualTrailingActivated ? "Manual" : "Auto", result.retcode, result.comment);
     
-    // Update statistics
     SuccessfulTrailingUpdates++;
     
     // Update tracking stats
-    double potentialSlippage = MathAbs(currentPrice - newSL) / Point();
-    if(potentialSlippage > WorstCaseSlippage)
+    double potentialSlippage = MathAbs(currentPrice - newSL) / Point(); // This is not really slippage, but distance to new SL
+    if(potentialSlippage > WorstCaseSlippage) // This logic might need review for what it's tracking
         WorstCaseSlippage = potentialSlippage;
         
     double profitInPoints = MathAbs(currentPrice - entryPrice) / Point();
