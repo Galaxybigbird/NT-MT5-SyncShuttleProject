@@ -1,6 +1,6 @@
 # NT-MT5 SyncShuttleProject
 
-## Overview (Project Still a Work In Progress With Fixes & Features Coming Soon)
+## Overview (Project still a work in progress with Fixes & Features Coming Soon)
 
 This project is a 3-part system designed to synchronize trading actions between NinjaTrader (NT) and MetaTrader 5 (MT5), primarily for hedging and copy trading purposes. The system consists of a NinjaTrader Addon, an MT5 Expert Advisor (EA), and a Go-based Bridge application. When trades occur on NT, corresponding hedge positions are managed on MT5. Conversely, when MT5 hedge positions are closed, the original NT trades are signaled for closure.
 
