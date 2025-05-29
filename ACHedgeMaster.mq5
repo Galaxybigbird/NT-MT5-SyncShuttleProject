@@ -1,5 +1,5 @@
 #property link      ""
-#property version   "2.05"
+#property version   "2.06"
 #property strict
 #property description "Hedge Receiver EA for Go bridge server with Asymmetrical Compounding"
 
@@ -3013,13 +3013,16 @@ bool AtomicRemoveArrayElement(string &array[], int index_to_remove, string array
     }
     
     // Replace original array with new array
-    ArrayFree(array);
+    // Corrected logic for string arrays
     if(new_size > 0) {
-        ArrayCopy(array, temp_array);
-        ArrayFree(temp_array);
+        ArrayResize(array, new_size); // Resize the original array first
+        for(int i = 0; i < new_size; i++) {
+            array[i] = temp_array[i]; // Copy elements one by one
+        }
     } else {
-        ArrayResize(array, 0);
+        ArrayResize(array, 0); // If new size is 0, just resize to 0
     }
+    ArrayFree(temp_array); // Free the temporary array
     
     // Validate final size
     int final_size = ArraySize(array);
@@ -3119,13 +3122,16 @@ bool AtomicRemoveArrayElement(int &array[], int index_to_remove, string array_na
     }
     
     // Replace original array with new array
-    ArrayFree(array);
+    // Corrected logic for int arrays
     if(new_size > 0) {
-        ArrayCopy(array, temp_array);
-        ArrayFree(temp_array);
+        ArrayResize(array, new_size); // Resize the original array first
+        for(int i = 0; i < new_size; i++) {
+            array[i] = temp_array[i]; // Copy elements one by one
+        }
     } else {
-        ArrayResize(array, 0);
+        ArrayResize(array, 0); // If new size is 0, just resize to 0
     }
+    ArrayFree(temp_array); // Free the temporary array
     
     // Validate final size
     int final_size = ArraySize(array);

@@ -1,17 +1,17 @@
 # NT-MT5 SyncShuttleProject
 
-## Overview
+## Overview (Project still a work in Progress with fixes & features coming asap)
 
-This project is a 3-part system designed to synchronize trading actions between NinjaTrader (NT) and MetaTrader 5 (MT5), primarily for hedging purposes. The system consists of a NinjaTrader Addon, an MT5 Expert Advisor (EA), and a Go-based Bridge application. When trades occur on NT, corresponding hedge positions are managed on MT5. Conversely, when MT5 hedge positions are closed, the original NT trades are signaled for closure.
+This project is a 3-part system designed to synchronize trading actions between NinjaTrader (NT) and MetaTrader 5 (MT5), primarily for hedging and copy trading purposes. The system consists of a NinjaTrader Addon, an MT5 Expert Advisor (EA), and a Go-based Bridge application. When trades occur on NT, corresponding hedge positions are managed on MT5. Conversely, when MT5 hedge positions are closed, the original NT trades are signaled for closure.
 
 ## Core Features
 
-*   **Bidirectional Trade Synchronization:**
-    *   New NT trades (entries/fills) trigger hedge position opening/adjustment on MT5.
-    *   Closure of MT5 hedge positions triggers closure of corresponding original NT trades.
+*   **Bidirectional/Unidirectional Trade Synchronization:**
+    *   New NT trades (entries/fills) trigger hedge (or parallel) position opening/adjustment on MT5.
+    *   Closure of MT5 hedge/parallel positions triggers closure of corresponding original NT trades.
 *   **Flexible Stop Loss / Take Profit (SL/TP) Management:**
     *   Option for NinjaTrader to remove its native SL/TP orders for new entries if `EnableSLTPRemoval` is active in the NT Addon.
-    *   MT5 EA can manage SL/TP for its hedge positions, including ATR-based trailing stops.
+    *   MT5 EA can manage SL/TP for its hedge/parallel positions, including ATR-based trailing stops.
 *   **Centralized Communication Bridge:** A Go-based application facilitates message passing between NT and MT5.
 *   **UI for NinjaTrader Addon:** Provides an interface for managing strategies and settings within NinjaTrader.
 
@@ -64,11 +64,11 @@ The system is composed of three main parts:
 ### Bridge Application
 1.  Navigate to the [`BridgeApp`](BridgeApp/) directory.
 2.  Build the Go application (e.g., `go build main.go`).
-3.  Run the compiled executable (e.g., `./main` or `main.exe`).
+3.  Run the compiled executable (e.g., `./main` or `main.exe`) or just type the command 'wails dev' within the (BridgeApp/) directory from the terminal.
 4.  Ensure the bridge is listening on the configured port (e.g., 5000).
 
 ### Network Configuration
-*   Verify that the NT Addon, MT5 EA, and Bridge application can communicate over the network (typically all on `localhost` using the configured port). Firewall exceptions might be needed.
+*   Verify that the NT Addon, MT5 EA, and Bridge application can communicate over the network (typically all on `localhost` using the configured port and/or the UI). Firewall exceptions might be needed.
 
 ## Workflow / How It Works
 
@@ -100,6 +100,10 @@ The system is composed of three main parts:
 *   **MT5 EA Inputs:** Bridge URL, Symbol Mapping, Hedging Ratio, Trailing Stop Activation Profit (%), ATR Period, ATR Multiplier.
 *   **Bridge:** Ensure it's running and accessible by both NT and MT5 on the configured host/port.
 
-## Troubleshooting Notes (Optional)
+## Troubleshooting Notes/Small Bugs To Keep In Mind (Optional)
 
-For debugging, refer to the Experts tab in MT5 for the EA, the terminal logs for the bridge, and the Ninjascript Output tab/logs for the NT Multi-Strategy Manager Addon
+*   For debugging, refer to the Experts tab in MT5 for the EA, the terminal logs for the bridge, and the Ninjascript Output tab/logs for the NT Multi-Strategy Manager Addon
+
+*   Bug: The UI component for hedgebot that switches the status to (active) takes about 15ish seconds to update to active if you loaded the ea first before starting up the bridge. 
+
+*   Bug: Reset bridge state is currently broken, a fix is coming soon with explanation of the feature
