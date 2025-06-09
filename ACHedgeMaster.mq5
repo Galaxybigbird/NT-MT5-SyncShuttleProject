@@ -1,5 +1,5 @@
 #property link      ""
-#property version   "2.33"
+#property version   "2.37"
 #property strict
 #property description "Hedge Receiver EA for Go bridge server with Asymmetrical Compounding"
 //+------------------------------------------------------------------+
@@ -427,6 +427,14 @@ string g_open_mt5_nt_accounts[]; // Stores corresponding NT Account Names
 string g_open_mt5_actions[];     // NEW: Stores the MT5 position type ("buy" or "sell") for open positions
 string g_open_mt5_original_nt_actions[];    // NEW: Stores original NT action for rehydrated open MT5 positions
 int    g_open_mt5_original_nt_quantities[]; // NEW: Stores original NT quantity for rehydrated open MT5 positions
+
+// DUPLICATE NOTIFICATION PREVENTION: Track positions closed by NT to prevent duplicate notifications
+long g_nt_closed_position_ids[];  // Stores position IDs that were closed by NT (to prevent duplicate notifications)
+datetime g_nt_closed_timestamps[]; // Stores timestamps when positions were closed by NT (for cleanup)
+
+// COMPREHENSIVE DUPLICATE PREVENTION: Track all notifications sent per base_id to prevent multiple notifications
+string g_notified_base_ids[];     // Stores base_ids that have already been notified
+datetime g_notified_timestamps[]; // Stores timestamps when notifications were sent (for cleanup)
 
 // Mutex-like mechanism to prevent concurrent array modifications
 bool g_array_modification_in_progress = false;
@@ -2145,6 +2153,12 @@ void OnTimer()
          // Only log details when there's actually an error
          ValidateArrayIntegrity(true);
       }
+
+      // DUPLICATE NOTIFICATION PREVENTION: Clean up old NT-closed tracking entries
+      CleanupNTClosedTracking();
+
+      // COMPREHENSIVE DUPLICATE PREVENTION: Clean up old notification tracking entries
+      CleanupNotificationTracking();
    }
 
    // --- Periodic Broker Spec Query (every 5 seconds if not ready) ---
@@ -3688,10 +3702,20 @@ bool CloseHedgePositionsForBaseId(string baseId, double quantity)
 
     bool anyPositionsClosed = false;
     int totalPositions = PositionsTotal();
+    int positionsClosedCount = 0;
+    int targetQuantity = (int)MathRound(quantity); // Convert to integer for position counting
+
+    Print("QUANTITY_CONTROL_FIX: Target quantity to close: ", targetQuantity, " positions");
 
     // Loop through all open positions to find matching base_id
     for(int i = totalPositions - 1; i >= 0; i--) // Reverse loop to handle position removal
     {
+        // QUANTITY_CONTROL_FIX: Stop if we've closed the requested quantity
+        if(positionsClosedCount >= targetQuantity) {
+            Print("QUANTITY_CONTROL_FIX: Reached target quantity (", targetQuantity, "). Stopping closure loop.");
+            break;
+        }
+
         ulong ticket = PositionGetTicket(i);
         if(ticket == 0) continue;
 
@@ -3733,39 +3757,17 @@ bool CloseHedgePositionsForBaseId(string baseId, double quantity)
                 Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] Successfully closed position ticket: ", ticket,
                       ". Result Code: ", localTrade.ResultRetcode(), ", Comment: ", localTrade.ResultComment());
                 anyPositionsClosed = true;
+                positionsClosedCount++; // QUANTITY_CONTROL_FIX: Increment counter
 
-                // Send hedge closure notification to NinjaTrader
-                string ntSymbol = "UNKNOWN";
-                string ntAccount = "UNKNOWN";
+                // DUPLICATE NOTIFICATION PREVENTION: Track this position as closed by NT
+                AddNTClosedPosition(ticket);
 
-                // Try to extract NT symbol and account from comment if available
-                if(StringFind(posComment, "NT:") != -1)
-                {
-                    // Extract NT symbol and account from comment format like "BaseID_123|NT:NQ 03-25|Account:Sim101"
-                    int ntPos = StringFind(posComment, "NT:");
-                    if(ntPos != -1)
-                    {
-                        int pipePos = StringFind(posComment, "|", ntPos);
-                        if(pipePos != -1)
-                        {
-                            ntSymbol = StringSubstr(posComment, ntPos + 3, pipePos - ntPos - 3);
-                        }
-                    }
+                // DO NOT send notification back to NT when closing in response to NT's CLOSE_HEDGE command
+                // This prevents the feedback loop where NT->MT5 closure triggers MT5->NT notification
+                // which would cause NT to send another CLOSE_HEDGE command, creating a chain reaction
+                Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] Position closed in response to NT CLOSE_HEDGE command. NOT sending notification back to NT to prevent feedback loop.");
 
-                    int accPos = StringFind(posComment, "Account:");
-                    if(accPos != -1)
-                    {
-                        ntAccount = StringSubstr(posComment, accPos + 8);
-                        // Remove any trailing characters after account name
-                        int endPos = StringFind(ntAccount, "|");
-                        if(endPos != -1) ntAccount = StringSubstr(ntAccount, 0, endPos);
-                    }
-                }
-
-                // Send notification
-                SendHedgeCloseNotification(baseId, ntSymbol, ntAccount, posVolume,
-                                         (posType == POSITION_TYPE_BUY) ? "buy" : "sell",
-                                         TimeCurrent(), "NT_ORIGINAL_TRADE_CLOSED");
+                Print("QUANTITY_CONTROL_FIX: Closed ", positionsClosedCount, " of ", targetQuantity, " requested positions.");
             }
             else
             {
@@ -3779,8 +3781,128 @@ bool CloseHedgePositionsForBaseId(string baseId, double quantity)
     {
         Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] No matching positions found for BaseID: '", baseId, "' - Position already closed. SUCCESS.");
     }
+    else
+    {
+        Print("QUANTITY_CONTROL_SUCCESS: Successfully closed ", positionsClosedCount, " positions out of ", targetQuantity, " requested for BaseID: '", baseId, "'");
+    }
 
     return true; // ALWAYS return success - closed is closed, doesn't matter how it got closed
+}
+
+//+------------------------------------------------------------------+
+//| DUPLICATE NOTIFICATION PREVENTION FUNCTIONS                     |
+//| Track positions closed by NT to prevent duplicate notifications |
+//+------------------------------------------------------------------+
+
+// Add a position ID to the NT-closed tracking list
+void AddNTClosedPosition(long position_id)
+{
+    int current_size = ArraySize(g_nt_closed_position_ids);
+    ArrayResize(g_nt_closed_position_ids, current_size + 1);
+    ArrayResize(g_nt_closed_timestamps, current_size + 1);
+
+    g_nt_closed_position_ids[current_size] = position_id;
+    g_nt_closed_timestamps[current_size] = TimeCurrent();
+
+    PrintFormat("DUPLICATE_PREVENTION: Added position %I64d to NT-closed tracking list. Total tracked: %d",
+               position_id, current_size + 1);
+}
+
+// Check if a position was closed by NT (to prevent duplicate notifications)
+bool IsPositionClosedByNT(long position_id)
+{
+    for(int i = 0; i < ArraySize(g_nt_closed_position_ids); i++)
+    {
+        if(g_nt_closed_position_ids[i] == position_id)
+        {
+            PrintFormat("DUPLICATE_PREVENTION: Position %I64d found in NT-closed tracking list. Skipping duplicate notification.", position_id);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Clean up old entries from NT-closed tracking (older than 60 seconds)
+void CleanupNTClosedTracking()
+{
+    datetime current_time = TimeCurrent();
+    int cleanup_threshold = 60; // 60 seconds
+
+    for(int i = ArraySize(g_nt_closed_position_ids) - 1; i >= 0; i--)
+    {
+        if(current_time - g_nt_closed_timestamps[i] > cleanup_threshold)
+        {
+            // Remove old entry
+            for(int j = i; j < ArraySize(g_nt_closed_position_ids) - 1; j++)
+            {
+                g_nt_closed_position_ids[j] = g_nt_closed_position_ids[j + 1];
+                g_nt_closed_timestamps[j] = g_nt_closed_timestamps[j + 1];
+            }
+            ArrayResize(g_nt_closed_position_ids, ArraySize(g_nt_closed_position_ids) - 1);
+            ArrayResize(g_nt_closed_timestamps, ArraySize(g_nt_closed_timestamps) - 1);
+
+            PrintFormat("DUPLICATE_PREVENTION: Cleaned up old NT-closed tracking entry. Remaining: %d",
+                       ArraySize(g_nt_closed_position_ids));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| COMPREHENSIVE DUPLICATE PREVENTION FUNCTIONS                    |
+//| Track all notifications sent per base_id to prevent duplicates  |
+//+------------------------------------------------------------------+
+
+// Add a base_id to the notification tracking list
+void AddNotifiedBaseId(string base_id)
+{
+    int current_size = ArraySize(g_notified_base_ids);
+    ArrayResize(g_notified_base_ids, current_size + 1);
+    ArrayResize(g_notified_timestamps, current_size + 1);
+
+    g_notified_base_ids[current_size] = base_id;
+    g_notified_timestamps[current_size] = TimeCurrent();
+
+    PrintFormat("COMPREHENSIVE_DUPLICATE_PREVENTION: Added base_id '%s' to notification tracking list. Total tracked: %d",
+               base_id, current_size + 1);
+}
+
+// Check if a base_id has already been notified (to prevent duplicate notifications)
+bool IsBaseIdAlreadyNotified(string base_id)
+{
+    for(int i = 0; i < ArraySize(g_notified_base_ids); i++)
+    {
+        if(g_notified_base_ids[i] == base_id)
+        {
+            PrintFormat("COMPREHENSIVE_DUPLICATE_PREVENTION: Base_id '%s' found in notification tracking list. Skipping duplicate notification.", base_id);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Clean up old entries from notification tracking (older than 300 seconds = 5 minutes)
+void CleanupNotificationTracking()
+{
+    datetime current_time = TimeCurrent();
+    int cleanup_threshold = 300; // 5 minutes
+
+    for(int i = ArraySize(g_notified_base_ids) - 1; i >= 0; i--)
+    {
+        if(current_time - g_notified_timestamps[i] > cleanup_threshold)
+        {
+            // Remove old entry
+            for(int j = i; j < ArraySize(g_notified_base_ids) - 1; j++)
+            {
+                g_notified_base_ids[j] = g_notified_base_ids[j + 1];
+                g_notified_timestamps[j] = g_notified_timestamps[j + 1];
+            }
+            ArrayResize(g_notified_base_ids, ArraySize(g_notified_base_ids) - 1);
+            ArrayResize(g_notified_timestamps, ArraySize(g_notified_timestamps) - 1);
+
+            PrintFormat("COMPREHENSIVE_DUPLICATE_PREVENTION: Cleaned up old notification tracking entry. Remaining: %d",
+                       ArraySize(g_notified_base_ids));
+        }
+    }
 }
 
 // Process all pending closures atomically to prevent array index desynchronization
@@ -3814,13 +3936,27 @@ void ProcessPendingClosuresBatch()
             }
         }
         
-        // Send notification if we have valid data
+        // Send notification if we have valid data AND no duplicates
         if(closure.base_id != "" && closure.mt5_action != "unknown" && closure.mt5_action != "" && closure.deal_volume > 0) {
-            PrintFormat("BATCH_PROCESSING: Sending notification[%d] for PosID %I64u - BaseID='%s', Action='%s', Volume=%f",
-                       i, closure.position_id, closure.base_id, closure.mt5_action, closure.deal_volume);
-            
-            SendHedgeCloseNotification(closure.base_id, closure.nt_symbol, closure.nt_account,
-                                     closure.deal_volume, closure.mt5_action, TimeCurrent(), closure_reason);
+            // COMPREHENSIVE DUPLICATE PREVENTION: Check if this base_id has already been notified
+            if(IsBaseIdAlreadyNotified(closure.base_id)) {
+                PrintFormat("BATCH_PROCESSING: Skipping notification[%d] for PosID %I64u - BaseID='%s' already notified (preventing duplicate notification)",
+                           i, closure.position_id, closure.base_id);
+            }
+            // DUPLICATE NOTIFICATION PREVENTION: Check if this position was closed by NT
+            else if(IsPositionClosedByNT(closure.position_id)) {
+                PrintFormat("BATCH_PROCESSING: Skipping notification[%d] for PosID %I64u - Position was closed by NT (preventing duplicate notification). BaseID='%s'",
+                           i, closure.position_id, closure.base_id);
+            } else {
+                PrintFormat("BATCH_PROCESSING: Sending notification[%d] for PosID %I64u - BaseID='%s', Action='%s', Volume=%f",
+                           i, closure.position_id, closure.base_id, closure.mt5_action, closure.deal_volume);
+
+                // COMPREHENSIVE DUPLICATE PREVENTION: Track this base_id as notified
+                AddNotifiedBaseId(closure.base_id);
+
+                SendHedgeCloseNotification(closure.base_id, closure.nt_symbol, closure.nt_account,
+                                         closure.deal_volume, closure.mt5_action, TimeCurrent(), closure_reason);
+            }
         } else {
             PrintFormat("BATCH_PROCESSING: Skipping notification[%d] for PosID %I64u - Invalid data: BaseID='%s', Action='%s', Volume=%f",
                        i, closure.position_id, closure.base_id, closure.mt5_action, closure.deal_volume);
