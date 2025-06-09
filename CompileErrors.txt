@@ -1,0 +1,4 @@
+NinjaScript File	Error	Code	Line	Column 
+MultiStratManager.cs	'MultiStratManager.OriginalTradeDetails' does not contain a definition for 'AccountName' and no accessible extension method 'AccountName' accepting a first argument of type 'MultiStratManager.OriginalTradeDetails' could be found (are you missing a using directive or an assembly reference?)	CS1061	1108	93
+NinjaScript File	Error	Code	Line	Column 
+MultiStratManager.cs	'MultiStratManager.OriginalTradeDetails' does not contain a definition for 'InstrumentName' and no accessible extension method 'InstrumentName' accepting a first argument of type 'MultiStratManager.OriginalTradeDetails' could be found (are you missing a using directive or an assembly reference?)	CS1061	1109	85

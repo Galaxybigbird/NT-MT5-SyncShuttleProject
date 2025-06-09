@@ -51,6 +51,12 @@ type Trade struct {
 	RawMeasurement  float64   `json:"raw_measurement,omitempty"`  // Raw measurement value
 	Instrument      string    `json:"instrument_name,omitempty"`  // Original NinjaTrader instrument symbol
 	AccountName     string    `json:"account_name,omitempty"`     // Original NinjaTrader account name
+
+	// Enhanced NT Performance Data for Elastic Hedging
+	NTBalance       float64 `json:"nt_balance,omitempty"`        // NT account balance
+	NTDailyPnL      float64 `json:"nt_daily_pnl,omitempty"`      // NT daily P&L
+	NTTradeResult   string  `json:"nt_trade_result,omitempty"`   // "win", "loss", or "pending"
+	NTSessionTrades int     `json:"nt_session_trades,omitempty"` // Number of trades in current session
 }
 
 // HedgeCloseNotification struct mirrors the JSON structure for hedge close notifications
@@ -62,6 +68,7 @@ type HedgeCloseNotification struct {
 	ClosedHedgeQuantity float64 `json:"closed_hedge_quantity"`
 	ClosedHedgeAction   string  `json:"closed_hedge_action"`
 	Timestamp           string  `json:"timestamp"`
+	ClosureReason       string  `json:"closure_reason"` // Added missing field
 }
 
 // MT5TradeResult struct mirrors the JSON payload from MT5 EA trade execution results
@@ -119,7 +126,8 @@ func (a *App) startServer() {
 	mux.HandleFunc("/log_trade", a.logTradeHandler)
 	mux.HandleFunc("/mt5/get_trade", a.getTradeHandler)
 	mux.HandleFunc("/health", a.healthHandler)
-	mux.HandleFunc("/notify_hedge_close", a.handleNotifyMT5HedgeClosure) // Renamed to match EA
+	mux.HandleFunc("/notify_hedge_close", a.handleNotifyMT5HedgeClosure) // FROM MT5 TO NT
+	mux.HandleFunc("/nt_close_hedge", a.handleNTCloseHedgeRequest)       // FROM NT TO MT5 - NEW
 	mux.HandleFunc("/mt5/trade_result", a.handleMT5TradeResult)          // New route for MT5 trade results
 
 	a.server = &http.Server{
@@ -258,6 +266,12 @@ func (a *App) getTradeHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Action: %s, Quantity: %.2f", trade.Action, trade.Quantity)
 		log.Printf("Contract: %d of %d", trade.ContractNum, trade.TotalQuantity)
 
+		// Special logging for closure requests
+		if trade.Action == "CLOSE_HEDGE" {
+			log.Printf("CLOSURE_BRIDGE_TO_MT5: Sending CLOSE_HEDGE request to MT5. BaseID: %s, Quantity: %.2f, OrderType: %s",
+				trade.BaseID, trade.Quantity, trade.OrderType)
+		}
+
 		// NOTE: hedgebotConnected field removed. Status tracked via /health pings.
 
 		// Construct the payload for the EA
@@ -275,6 +289,12 @@ func (a *App) getTradeHandler(w http.ResponseWriter, r *http.Request) {
 			"raw_measurement":      trade.RawMeasurement,
 			"nt_instrument_symbol": trade.Instrument,  // Added new field
 			"nt_account_name":      trade.AccountName, // Added new field
+
+			// Enhanced NT Performance Data for Elastic Hedging
+			"nt_balance":        trade.NTBalance,
+			"nt_daily_pnl":      trade.NTDailyPnL,
+			"nt_trade_result":   trade.NTTradeResult,
+			"nt_session_trades": trade.NTSessionTrades,
 		}
 
 		// CRITICAL_DEBUG: Log JSON string before sending
@@ -333,28 +353,198 @@ func (a *App) handleNotifyMT5HedgeClosure(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// MISSING_DATA_FIX: Validate and clean base_id before processing
+	originalBaseID := notification.BaseID
+	if len(notification.BaseID) > 50 {
+		log.Printf("WARNING: BaseID appears truncated or corrupted: '%s' (length: %d). Attempting to clean...", notification.BaseID, len(notification.BaseID))
+		// Keep only the first 36 characters if it looks like a GUID
+		if len(notification.BaseID) >= 36 {
+			notification.BaseID = notification.BaseID[:36]
+			log.Printf("MISSING_DATA_FIX: Cleaned BaseID from '%s' to '%s'", originalBaseID, notification.BaseID)
+		}
+	}
+
 	log.Printf("=== Received hedge_close_notification ===")
 	log.Printf("Base ID: %s, EventType: %s, Symbol: %s, Account: %s", notification.BaseID, notification.EventType, notification.NTInstrumentSymbol, notification.NTAccountName)
 	log.Printf("Closed Quantity: %.2f, Closed Action: %s, Timestamp: %s", notification.ClosedHedgeQuantity, notification.ClosedHedgeAction, notification.Timestamp)
 
 	// Update bridge state based on hedge closure
 	a.queueMux.Lock()
+	oldHedge := a.hedgeLot
+
+	// FIXED: MT5 hedge closure should NOT affect NT net position
+	// The net position is only managed by NT trade notifications
+	// MT5 hedge closures are just confirmations that the hedge was closed
+	log.Printf("MT5 closed %.2f %s hedge contracts. Net position remains: %d (unchanged)",
+		notification.ClosedHedgeQuantity, notification.ClosedHedgeAction, a.netNT)
+
+	// Update hedge size to match the current net position (should already be correct)
+	desiredHedgeLot := float64(a.netNT)
+	if a.hedgeLot != desiredHedgeLot {
+		log.Printf("=== Hedge Position Update (from MT5 closure notification) ===")
+		log.Printf("Previous hedge size: %.2f", oldHedge)
+		log.Printf("New hedge size: %.2f", desiredHedgeLot)
+		log.Printf("SYNC_FIX: Correcting hedge size to match net position after MT5 closure")
+		a.hedgeLot = desiredHedgeLot
+	}
+	a.queueMux.Unlock()
+
+	// Emit event to UI to update displayed position/hedge size
+	runtime.EventsEmit(a.ctx, "positionUpdated", map[string]interface{}{"net_position": a.netNT, "hedge_size": a.hedgeLot})
+
+	// Forward to NinjaTrader Addon with retry logic
+	ntAddonURL := "http://localhost:8081/notify_hedge_closed" // As per specification
+
+	// Enhanced retry logic for critical closure notifications
+	maxRetries := 3
+	var lastErr error
+	var resp *http.Response
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, ntAddonURL, bytes.NewBuffer(bodyBytes))
+		if err != nil {
+			log.Printf("ERROR: Failed to create request to NinjaTrader Addon on attempt %d/%d: %v", attempt, maxRetries, err)
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		// Progressive timeout increase
+		timeout := time.Duration(5+attempt*2) * time.Second
+		client := &http.Client{Timeout: timeout}
+
+		log.Printf("MT5_TO_NT_BRIDGE: Attempt %d/%d forwarding closure notification for BaseID '%s' to NT (timeout: %v)",
+			attempt, maxRetries, notification.BaseID, timeout)
+
+		resp, err = client.Do(req)
+		if err != nil {
+			log.Printf("MT5_TO_NT_BRIDGE: Attempt %d/%d failed for BaseID '%s': %v", attempt, maxRetries, notification.BaseID, err)
+			lastErr = err
+
+			if attempt < maxRetries {
+				// Progressive backoff: 500ms, 1000ms, 1500ms
+				backoffDuration := time.Duration(500*attempt) * time.Millisecond
+				log.Printf("MT5_TO_NT_BRIDGE: Retrying in %v...", backoffDuration)
+				time.Sleep(backoffDuration)
+			}
+			continue
+		}
+
+		// Success - break out of retry loop
+		log.Printf("MT5_TO_NT_BRIDGE: SUCCESS - Forwarded closure notification for BaseID '%s' on attempt %d", notification.BaseID, attempt)
+		break
+	}
+
+	if resp == nil {
+		log.Printf("MT5_TO_NT_BRIDGE: CRITICAL FAILURE - Failed to forward closure notification for BaseID '%s' after %d attempts. Last error: %v",
+			notification.BaseID, maxRetries, lastErr)
+		// Return error to MT5 so it knows the notification failed
+		http.Error(w, fmt.Sprintf("Failed to forward to NinjaTrader after %d attempts: %v", maxRetries, lastErr), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Check response status and validate response
+	if resp.StatusCode == http.StatusOK {
+		// Read and validate the response from NinjaTrader
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("MT5_TO_NT_BRIDGE: ERROR - Failed to read response from NinjaTrader Addon for BaseID '%s': %v", notification.BaseID, err)
+			http.Error(w, "Failed to read NinjaTrader response", http.StatusBadGateway)
+			return
+		}
+
+		// Parse response to ensure it's valid JSON (optional validation)
+		var ntResponse map[string]interface{}
+		if err := json.Unmarshal(respBody, &ntResponse); err != nil {
+			log.Printf("MT5_TO_NT_BRIDGE: WARNING - NinjaTrader response is not valid JSON for BaseID '%s': %s", notification.BaseID, string(respBody))
+			// Still consider it success if we got HTTP 200, but log the issue
+		}
+
+		// Success - send proper success response to MT5
+		log.Printf("MT5_TO_NT_BRIDGE: SUCCESS - Forwarded hedge_close_notification for BaseID '%s' to NinjaTrader Addon. Status: %s",
+			notification.BaseID, resp.Status)
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":    "success",
+			"message":   "Hedge closure notification processed and forwarded successfully",
+			"base_id":   notification.BaseID,
+			"nt_status": resp.Status,
+		})
+	} else {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("MT5_TO_NT_BRIDGE: ERROR - NinjaTrader Addon returned non-200 status: %s for BaseID '%s'. Response: %s",
+			resp.Status, notification.BaseID, string(body))
+		// Return error to MT5 so it knows the notification failed
+		http.Error(w, fmt.Sprintf("NinjaTrader Addon rejected notification with status %s", resp.Status), http.StatusBadGateway)
+	}
+}
+
+// handleNTCloseHedgeRequest handles hedge closure requests from NinjaTrader
+// This is the reverse flow: NT -> Bridge -> MT5
+func (a *App) handleNTCloseHedgeRequest(w http.ResponseWriter, r *http.Request) {
+	log.Println("DEBUG: Entered handleNTCloseHedgeRequest")
+
+	if r.Method != http.MethodPost {
+		log.Printf("ERROR: Invalid request method for /nt_close_hedge: %s", r.Method)
+		http.Error(w, "Invalid request method. Only POST is allowed.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Read the request body
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("ERROR: Failed to read request body from /nt_close_hedge: %v", err)
+		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	// Parse the hedge closure notification from NinjaTrader
+	var notification HedgeCloseNotification
+	if err := json.Unmarshal(bodyBytes, &notification); err != nil {
+		log.Printf("ERROR: Failed to decode JSON from /nt_close_hedge: %v. Body: %s", err, string(bodyBytes))
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	// Validate the notification
+	if notification.EventType != "hedge_close_notification" {
+		log.Printf("ERROR: Invalid notification type: %s. Expected 'hedge_close_notification'. Body: %s", notification.EventType, string(bodyBytes))
+		http.Error(w, "Invalid notification type", http.StatusBadRequest)
+		return
+	}
+	if notification.BaseID == "" {
+		log.Printf("ERROR: Missing base_id in NT hedge_close_notification. Body: %s", string(bodyBytes))
+		http.Error(w, "Missing base_id", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("=== Received NT hedge_close_notification ===")
+	log.Printf("Base ID: %s, EventType: %s, Symbol: %s, Account: %s", notification.BaseID, notification.EventType, notification.NTInstrumentSymbol, notification.NTAccountName)
+	log.Printf("Closed Quantity: %.2f, Closed Action: %s, Timestamp: %s", notification.ClosedHedgeQuantity, notification.ClosedHedgeAction, notification.Timestamp)
+	log.Printf("Closure Reason: %s", notification.ClosureReason)
+
+	// Update bridge state based on NT closure
+	a.queueMux.Lock()
 	oldNT := a.netNT
 	oldHedge := a.hedgeLot
 
-	// Update net position based on the closed hedge action
-	if notification.ClosedHedgeAction == "buy" { // Closing a short hedge means increasing net long position
-		a.netNT += int(notification.ClosedHedgeQuantity)
-		log.Printf("Closing %.2f short hedge contracts. Net position: %d → %d", notification.ClosedHedgeQuantity, oldNT, a.netNT)
-	} else if notification.ClosedHedgeAction == "sell" { // Closing a long hedge means decreasing net long position
+	// Update net position based on the NT closure action
+	// When NT closes a position, we need to close the corresponding hedge
+	if notification.ClosedHedgeAction == "sell" { // NT sold (closed long), so reduce net long position
 		a.netNT -= int(notification.ClosedHedgeQuantity)
-		log.Printf("Closing %.2f long hedge contracts. Net position: %d → %d", notification.ClosedHedgeQuantity, oldNT, a.netNT)
+		log.Printf("NT closed %.2f long contracts. Net position: %d → %d", notification.ClosedHedgeQuantity, oldNT, a.netNT)
+	} else if notification.ClosedHedgeAction == "buy" || notification.ClosedHedgeAction == "buytocover" { // NT bought to cover (closed short), so reduce net short position
+		a.netNT += int(notification.ClosedHedgeQuantity)
+		log.Printf("NT closed %.2f short contracts. Net position: %d → %d", notification.ClosedHedgeQuantity, oldNT, a.netNT)
 	}
 
 	// Update hedge size to match the new net position
 	desiredHedgeLot := float64(a.netNT)
 	if a.hedgeLot != desiredHedgeLot {
-		log.Printf("=== Hedge Position Update (from closure notification) ===")
+		log.Printf("=== Hedge Position Update (from NT closure) ===")
 		log.Printf("Previous hedge size: %.2f", oldHedge)
 		log.Printf("New hedge size: %.2f", desiredHedgeLot)
 		a.hedgeLot = desiredHedgeLot
@@ -364,41 +554,34 @@ func (a *App) handleNotifyMT5HedgeClosure(w http.ResponseWriter, r *http.Request
 	// Emit event to UI to update displayed position/hedge size
 	runtime.EventsEmit(a.ctx, "positionUpdated", map[string]interface{}{"net_position": a.netNT, "hedge_size": a.hedgeLot})
 
-	// Forward to NinjaTrader Addon
-	ntAddonURL := "http://localhost:8081/notify_hedge_closed" // As per specification
-	req, err := http.NewRequest(http.MethodPost, ntAddonURL, bytes.NewBuffer(bodyBytes))
-	if err != nil {
-		log.Printf("ERROR: Failed to create request to NinjaTrader Addon: %v", err)
-		// Respond to MT5 EA with an error, as forwarding couldn't even be attempted properly
-		http.Error(w, "Internal server error: failed to create forwarding request", http.StatusInternalServerError)
-		return
+	// Add a special message to the trade queue so MT5 can pick it up and close hedges
+	closureTradeMessage := Trade{
+		ID:            fmt.Sprintf("nt_close_%s_%d", notification.BaseID, time.Now().Unix()),
+		BaseID:        notification.BaseID,
+		Time:          time.Now(),
+		Action:        "CLOSE_HEDGE", // Special action to indicate hedge closure
+		Quantity:      notification.ClosedHedgeQuantity,
+		Price:         0, // Not relevant for closures
+		TotalQuantity: int(notification.ClosedHedgeQuantity),
+		ContractNum:   1,
+		Instrument:    notification.NTInstrumentSymbol,
+		AccountName:   notification.NTAccountName,
+		OrderType:     "NT_CLOSE",
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second} // Use a timeout for the client
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("ERROR: Failed to forward hedge_close_notification to NinjaTrader Addon (%s): %v", ntAddonURL, err)
-		// Still respond 200 to MT5 EA as the BridgeApp processed it, but log the forwarding error.
-		// The problem is between Bridge and NT Addon, not MT5 and Bridge at this point.
-		// Alternatively, could send a 502 Bad Gateway or 504 Gateway Timeout if desired.
-		// For now, let's assume MT5 just needs to know Bridge got it.
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "received_by_bridge", "forwarding_status": "failed", "error": err.Error()})
-		return
-	}
-	defer resp.Body.Close()
+	log.Printf("CLOSURE_DEBUG: Attempting to queue CLOSE_HEDGE message for MT5. BaseID: %s, Action: %s, Quantity: %.2f",
+		notification.BaseID, closureTradeMessage.Action, closureTradeMessage.Quantity)
 
-	if resp.StatusCode == http.StatusOK {
-		log.Printf("Successfully forwarded hedge_close_notification for base_id: %s to NinjaTrader Addon. Status: %s", notification.BaseID, resp.Status)
+	select {
+	case a.tradeQueue <- closureTradeMessage:
+		log.Printf("CLOSURE_SUCCESS: NT hedge closure request queued for MT5. BaseID: %s, Queue size now: %d",
+			notification.BaseID, len(a.tradeQueue))
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "received_by_bridge", "forwarding_status": "success"})
-	} else {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("ERROR: NinjaTrader Addon responded with status %s for hedge_close_notification (base_id: %s). Response: %s", resp.Status, notification.BaseID, string(body))
-		// Again, respond 200 to MT5 EA, indicating Bridge received it but forwarding had issues.
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "received_by_bridge", "forwarding_status": "addon_error", "addon_status_code": resp.Status, "addon_response": string(body)})
+		json.NewEncoder(w).Encode(map[string]string{"status": "success", "message": "NT closure request queued for MT5"})
+	default:
+		log.Printf("CLOSURE_ERROR: Queue full, NT closure request not processed for BaseID: %s. Current queue size: %d",
+			notification.BaseID, len(a.tradeQueue))
+		http.Error(w, "queue full", http.StatusServiceUnavailable)
 	}
 }
 

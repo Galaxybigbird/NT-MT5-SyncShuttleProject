@@ -15,6 +15,10 @@ export namespace main {
 	    raw_measurement?: number;
 	    instrument_name?: string;
 	    account_name?: string;
+	    nt_balance?: number;
+	    nt_daily_pnl?: number;
+	    nt_trade_result?: string;
+	    nt_session_trades?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Trade(source);
@@ -35,6 +39,10 @@ export namespace main {
 	        this.raw_measurement = source["raw_measurement"];
 	        this.instrument_name = source["instrument_name"];
 	        this.account_name = source["account_name"];
+	        this.nt_balance = source["nt_balance"];
+	        this.nt_daily_pnl = source["nt_daily_pnl"];
+	        this.nt_trade_result = source["nt_trade_result"];
+	        this.nt_session_trades = source["nt_session_trades"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

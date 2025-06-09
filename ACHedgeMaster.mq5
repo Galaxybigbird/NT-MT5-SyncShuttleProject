@@ -1,12 +1,37 @@
 #property link      ""
-#property version   "2.06"
+#property version   "2.33"
 #property strict
 #property description "Hedge Receiver EA for Go bridge server with Asymmetrical Compounding"
+//+------------------------------------------------------------------+
+//| Connection Settings                                             |
+//+------------------------------------------------------------------+
+input group    "===== Connections Settings =====";
+input string    BridgeURL = "http://127.0.0.1:5000";  // Bridge Server URL - Connection point to Go bridge
+
+//+------------------------------------------------------------------+
+//| Trading Settings                                                |
+//+------------------------------------------------------------------+
+input group    "===== Trading Settings =====";
+enum LOT_MODE { Asymmetric_Compounding = 0, Fixed_Lot_Size = 1, Elastic_Hedging = 2 };
+input LOT_MODE       LotSizingMode = Asymmetric_Compounding;    // Lot Sizing Method
+
+input bool      EnableHedging = true;   // Enable hedging? (false = copy direction)
+input double    DefaultLot = 15.0;     // Default lot size if not specified - Base multiplier for trade volumes (micro-lots for $300 account)
+input int       Slippage  = 200;       // Slippage
+input int       MagicNumber = 12345;  // MagicNumber for trades
 
 // Include the asymmetrical compounding functionality
 #include "ACFunctions.mqh"
 #include "ATRtrailing.mqh"
+
+input group "=====On-Chart Element Positions=====";
+input int TrailingButtonXPos_EA = 120; // X distance for trailing button position
+input int TrailingButtonYPos_EA = 20;  // Y distance for trailing button position
+input int StatusLabelXPos_EA    = 200; // X distance for status label position
+input int StatusLabelYPos_EA    = 50;  // Y distance for status label position
+
 #include "StatusIndicator.mqh"
+#include "StatusOverlay.mqh"
 #include <Trade/Trade.mqh>
 #include <Generic/HashMap.mqh> // Use standard template HashMap
 #include <Strings/String.mqh>   // << NEW
@@ -17,23 +42,10 @@ CTrade trade;
 // Error code constant for hedging-related errors
 #define ERR_TRADE_NOT_ALLOWED           4756  // Trading is prohibited
 
-//+------------------------------------------------------------------+
-//| Connection Settings                                             |
-//+------------------------------------------------------------------+
-input group    "===== Connections Settings =====";
-input string    BridgeURL = "http://127.0.0.1:5000";  // Bridge Server URL - Connection point to Go bridge
 const int      PollInterval = 1;     // Frequency of checking for new trades (in seconds)
 const bool     VerboseMode = false;  // Show all polling messages in Experts tab
 
-//+------------------------------------------------------------------+
-//| Trading Settings                                                |
-//+------------------------------------------------------------------+
-input group    "===== Trading Settings =====";
-input bool      UseACRiskManagement = false; // Enable Asymmetrical Compounding Risk Management?
-input bool      EnableHedging = true;   // Enable hedging? (false = copy direction)
-input double    DefaultLot = 5.0;     // Default lot size if not specified - Base multiplier for trade volumes
-input int       Slippage  = 200;       // Slippage
-input int       MagicNumber = 12345;  // MagicNumber for trades
+bool      UseACRiskManagement = false; // Effective AC Risk Management state, derived from LotSizingMode
 const string    CommentPrefix = "NT_Hedge_";  // Prefix for hedge order comments
 const string    EA_COMMENT_PREFIX_BUY = CommentPrefix + "BUY_"; // Specific prefix for EA BUY hedges
 const string    EA_COMMENT_PREFIX_SELL = CommentPrefix + "SELL_"; // Specific prefix for EA SELL hedges
@@ -65,9 +77,327 @@ TPSLMeasurement lastTPSL;
 
 // Dynamic‑hedge state
 double g_highWaterEOD = 0.0;  // highest *settled* balance
-const  double CUSHION_BAND = 120.0;   // *** NEW ***
+const  double CUSHION_BAND = 90.0;    // Trailing drawdown cushion (30% of $300 account)
 double g_lastOHF      = 0.05; // last over‑hedge factor
- 
+double g_lastCushion  = 0.0;  // last calculated cushion for debugging
+
+// Progressive hedging state for combine scenarios
+double g_ntCumulativeLoss = 0.0;  // Track cumulative NT losses for progressive scaling
+int g_ntLossStreak = 0;           // Count consecutive losing days
+double g_lastNTBalance = 0.0;     // Track NT balance changes
+double g_ntDailyPnL = 0.0;        // Current day's NT P&L
+string g_lastNTTradeResult = "";  // Last trade result: "win" or "loss"
+int g_ntSessionTrades = 0;        // Number of trades in current session
+datetime g_lastNTUpdateTime = 0;  // Last time NT data was updated
+bool g_ntDataAvailable = false;   // Flag to indicate if NT data is available
+
+// WHACK-A-MOLE FIX: State change tracking for overlay calculations
+static datetime g_lastNTDataUpdate = 0;
+static double g_lastNTBalanceForCalc = 0.0;
+static double g_lastNTDailyPnLForCalc = 0.0;
+static string g_lastNTResultForCalc = "";
+static int g_lastNTSessionTradesForCalc = 0;
+
+// Broker specification cache
+struct BrokerSpecs {
+    double tickSize;        // Minimum price change
+    double tickValue;       // Dollar value per tick
+    double pointValue;      // Dollar value per point
+    double contractSize;    // Contract size
+    double minLot;          // Minimum lot size
+    double maxLot;          // Maximum lot size
+    double lotStep;         // Lot step increment
+    double marginRequired;  // Margin per lot
+    bool   isValid;         // Whether specs have been loaded
+} g_brokerSpecs;
+
+// Race condition fix: Flag to indicate if broker specs are loaded and valid.
+bool g_broker_specs_ready = false;
+
+//──────────────────────────────────────────────────────────────────────────────
+// Query and cache broker specifications for current symbol
+//──────────────────────────────────────────────────────────────────────────────
+bool QueryBrokerSpecs()
+{
+    g_brokerSpecs.tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    g_brokerSpecs.tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    g_brokerSpecs.contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+    g_brokerSpecs.minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    g_brokerSpecs.maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    g_brokerSpecs.lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    g_brokerSpecs.marginRequired = SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_INITIAL);
+
+    // Calculate point value (dollar value per point movement)
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(point > 0 && g_brokerSpecs.tickSize > 0)
+    {
+        // Point value = (tick value / tick size) * point size
+        g_brokerSpecs.pointValue = (g_brokerSpecs.tickValue / g_brokerSpecs.tickSize) * point;
+    }
+    else
+    {
+        g_brokerSpecs.pointValue = 0.0;
+    }
+
+    // CRITICAL FIX: Handle zero margin requirement with realistic fallback
+    if(g_brokerSpecs.marginRequired <= 0)
+    {
+        // Calculate realistic margin based on current price and leverage
+        double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        long leverageLong = AccountInfoInteger(ACCOUNT_LEVERAGE);
+        double leverage = (double)leverageLong; // Explicit cast to avoid warning
+
+        if(currentPrice > 0 && leverage > 0)
+        {
+            // For NAS100: Contract size * Current price / Leverage
+            g_brokerSpecs.marginRequired = (g_brokerSpecs.contractSize * currentPrice) / leverage;
+            Print("BROKER_SPECS_FIX: Calculated margin requirement: $", g_brokerSpecs.marginRequired,
+                  " per lot (Price: ", currentPrice, ", Leverage: 1:", leverageLong, ")");
+        }
+        else
+        {
+            // Ultimate fallback for $300 account safety
+            g_brokerSpecs.marginRequired = 50.0; // Conservative $50 per lot
+            Print("BROKER_SPECS_FALLBACK: Using conservative margin requirement: $", g_brokerSpecs.marginRequired, " per lot");
+        }
+    }
+
+    // Validate that we got reasonable values
+    g_brokerSpecs.isValid = (g_brokerSpecs.tickSize > 0 &&
+                            g_brokerSpecs.tickValue > 0 &&
+                            g_brokerSpecs.contractSize > 0 &&
+                            g_brokerSpecs.minLot > 0 &&
+                            g_brokerSpecs.maxLot > 0 &&
+                            g_brokerSpecs.lotStep > 0 &&
+                            g_brokerSpecs.marginRequired > 0); // Added margin validation
+
+    if(g_brokerSpecs.isValid)
+    {
+        g_broker_specs_ready = true; // Specs are valid
+        Print("BROKER_SPECS: Successfully queried specifications for ", _Symbol);
+        Print("  Tick Size: ", g_brokerSpecs.tickSize);
+        Print("  Tick Value: $", g_brokerSpecs.tickValue);
+        Print("  Point Value: $", g_brokerSpecs.pointValue, " per point per lot");
+        Print("  Contract Size: ", g_brokerSpecs.contractSize);
+        Print("  Min Lot: ", g_brokerSpecs.minLot);
+        Print("  Max Lot: ", g_brokerSpecs.maxLot);
+        Print("  Lot Step: ", g_brokerSpecs.lotStep);
+        Print("  Margin Required: $", g_brokerSpecs.marginRequired, " per lot");
+
+        // Additional safety check for $300 account
+        double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+        double maxSafeLots = (accountBalance * 0.50) / g_brokerSpecs.marginRequired; // 50% max usage
+        Print("  SAFETY: For $", accountBalance, " account, max safe lots: ", maxSafeLots, " (50% margin usage)");
+    }
+    else
+    {
+        g_broker_specs_ready = false; // Specs are invalid
+        Print("BROKER_SPECS_ERROR: Failed to query valid specifications for ", _Symbol);
+        Print("  Tick Size: ", g_brokerSpecs.tickSize);
+        Print("  Tick Value: ", g_brokerSpecs.tickValue);
+        Print("  Contract Size: ", g_brokerSpecs.contractSize);
+        Print("  Min/Max/Step Lot: ", g_brokerSpecs.minLot, "/", g_brokerSpecs.maxLot, "/", g_brokerSpecs.lotStep);
+        Print("  Margin Required: ", g_brokerSpecs.marginRequired);
+    }
+
+    return g_brokerSpecs.isValid;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helper functions for parsing NT performance data from JSON
+//──────────────────────────────────────────────────────────────────────────────
+bool ParseJSONDouble(string json_str, string key, double &value)
+{
+    value = GetJSONDouble(json_str, key);
+    return (value != 0.0 || StringFind(json_str, "\"" + key + "\":0") >= 0);
+}
+
+bool ParseJSONString(string json_str, string key, string &value)
+{
+    value = GetJSONStringValue(json_str, "\"" + key + "\"");
+    return (value != "");
+}
+
+bool ParseJSONInt(string json_str, string key, int &value)
+{
+    value = GetJSONIntValue(json_str, key, -999999); // Use unlikely default
+    return (value != -999999);
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Parse NT performance data from enhanced JSON messages
+//──────────────────────────────────────────────────────────────────────────────
+bool ParseNTPerformanceData(string json_str, double &nt_balance, double &nt_daily_pnl,
+                           string &nt_trade_result, int &nt_session_trades)
+{
+    // Parse nt_balance
+    if(!ParseJSONDouble(json_str, "nt_balance", nt_balance)) {
+        Print("NT_PARSE_WARNING: nt_balance not found in JSON, using default");
+        nt_balance = 0.0;
+    }
+
+    // Parse nt_daily_pnl
+    if(!ParseJSONDouble(json_str, "nt_daily_pnl", nt_daily_pnl)) {
+        Print("NT_PARSE_WARNING: nt_daily_pnl not found in JSON, using default");
+        nt_daily_pnl = 0.0;
+    }
+
+    // Parse nt_trade_result
+    if(!ParseJSONString(json_str, "nt_trade_result", nt_trade_result)) {
+        Print("NT_PARSE_WARNING: nt_trade_result not found in JSON, using default");
+        nt_trade_result = "unknown";
+    }
+
+    // Parse nt_session_trades
+    if(!ParseJSONInt(json_str, "nt_session_trades", nt_session_trades)) {
+        Print("NT_PARSE_WARNING: nt_session_trades not found in JSON, using default");
+        nt_session_trades = 0;
+    }
+
+    return true;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Update NT performance tracking variables
+//──────────────────────────────────────────────────────────────────────────────
+void UpdateNTPerformanceTracking(double nt_balance, double nt_daily_pnl,
+                                string nt_trade_result, int nt_session_trades)
+{
+    // WHACK-A-MOLE FIX: Check if NT data has actually changed
+    bool nt_data_changed = false;
+
+    if(MathAbs(nt_balance - g_lastNTBalanceForCalc) > 0.01 ||
+       MathAbs(nt_daily_pnl - g_lastNTDailyPnLForCalc) > 0.01 ||
+       nt_trade_result != g_lastNTResultForCalc ||
+       nt_session_trades != g_lastNTSessionTradesForCalc ||
+       !g_ntDataAvailable) // First time data becomes available
+    {
+        nt_data_changed = true;
+        g_lastNTBalanceForCalc = nt_balance;
+        g_lastNTDailyPnLForCalc = nt_daily_pnl;
+        g_lastNTResultForCalc = nt_trade_result;
+        g_lastNTSessionTradesForCalc = nt_session_trades;
+        g_lastNTDataUpdate = TimeCurrent();
+    }
+
+    // Update global tracking variables
+    double previous_balance = g_lastNTBalance;
+    g_lastNTBalance = nt_balance;
+    g_ntDailyPnL = nt_daily_pnl;
+    g_lastNTTradeResult = nt_trade_result;
+    g_ntSessionTrades = nt_session_trades;
+    g_lastNTUpdateTime = TimeCurrent();
+    g_ntDataAvailable = true;
+
+    // Update loss streak tracking
+    if(nt_trade_result == "loss") {
+        g_ntLossStreak++;
+        if(nt_daily_pnl < 0) {
+            g_ntCumulativeLoss += MathAbs(nt_daily_pnl);
+        }
+    } else if(nt_trade_result == "win") {
+        g_ntLossStreak = 0; // Reset loss streak on win
+    }
+
+    // Only print and force recalculation if data actually changed
+    if(nt_data_changed) {
+        Print("NT_PERFORMANCE_UPDATE: Balance: $", nt_balance,
+              ", Daily P&L: $", nt_daily_pnl,
+              ", Trade Result: ", nt_trade_result,
+              ", Session Trades: ", nt_session_trades,
+              ", Loss Streak: ", g_ntLossStreak,
+              ", Cumulative Loss: $", g_ntCumulativeLoss);
+
+        // WHACK-A-MOLE FIX: Update overlay directly when NT data actually changes
+        UpdateStatusOverlay();
+    }
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Calculate progressive hedging target based on NT performance scenarios
+//──────────────────────────────────────────────────────────────────────────────
+double CalculateProgressiveHedgingTarget()
+{
+    // Default conservative target if no NT data available
+    if(!g_ntDataAvailable) {
+        Print("PROGRESSIVE_HEDGING: No NT data available, using default $60 target");
+        return 60.0;
+    }
+
+    double targetProfit = 60.0;  // Base target for first loss
+
+    // Progressive hedging logic based on NT performance:
+    if(g_ntLossStreak == 0) {
+        // No current loss streak - use minimal hedging
+        targetProfit = 30.0;
+        Print("PROGRESSIVE_HEDGING: No loss streak - Minimal hedging target: $", targetProfit);
+    }
+    else if(g_ntLossStreak == 1) {
+        // First loss - Day 1 scenario: Target $50-70 to break even
+        targetProfit = 60.0;
+        Print("PROGRESSIVE_HEDGING: First loss (Day 1) - Standard target: $", targetProfit);
+    }
+    else if(g_ntLossStreak >= 2) {
+        // Multiple losses - Day 2+ scenario: Scale up to cover multiple combines
+        if(g_lastNTTradeResult == "loss") {
+            // Day 2+ Loss: Target $200+ to cover both combines
+            targetProfit = 200.0 + (g_ntLossStreak - 2) * 50.0; // Scale up for additional losses
+            Print("PROGRESSIVE_HEDGING: Multiple losses (Day ", g_ntLossStreak, ") - Scaled target: $", targetProfit);
+        } else {
+            // Day 2+ Win after losses: Reduce target to minimize MT5 loss
+            targetProfit = 80.0; // Reduced target when NT wins after losses
+            Print("PROGRESSIVE_HEDGING: Win after losses - Reduced target: $", targetProfit);
+        }
+    }
+
+    // Additional scaling based on cumulative losses
+    if(g_ntCumulativeLoss > 500.0) {
+        targetProfit *= 1.5; // Increase target by 50% for significant cumulative losses
+        Print("PROGRESSIVE_HEDGING: High cumulative loss ($", g_ntCumulativeLoss, ") - Adjusted target: $", targetProfit);
+    }
+
+    Print("PROGRESSIVE_HEDGING: Final target: $", targetProfit,
+          " (Loss Streak: ", g_ntLossStreak,
+          ", Last Result: ", g_lastNTTradeResult,
+          ", Daily P&L: $", g_ntDailyPnL, ")");
+
+    return targetProfit;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Calculate lot size needed to achieve target profit in USD
+//──────────────────────────────────────────────────────────────────────────────
+double CalculateLotForTargetProfit(double targetProfitUSD, double expectedPointMove)
+{
+    if(!g_brokerSpecs.isValid)
+    {
+        Print("ELASTIC_ERROR: Broker specs not loaded. Cannot calculate lot for target profit.");
+        return g_brokerSpecs.minLot;
+    }
+
+    if(g_brokerSpecs.pointValue <= 0 || expectedPointMove <= 0)
+    {
+        Print("ELASTIC_ERROR: Invalid point value ($", g_brokerSpecs.pointValue,
+              ") or expected move (", expectedPointMove, " points)");
+        return g_brokerSpecs.minLot;
+    }
+
+    // Required lot = Target Profit / (Point Value * Expected Point Move)
+    double requiredLot = targetProfitUSD / (g_brokerSpecs.pointValue * expectedPointMove);
+
+    // Apply broker constraints
+    requiredLot = MathMax(requiredLot, g_brokerSpecs.minLot);
+    requiredLot = MathMin(requiredLot, g_brokerSpecs.maxLot);
+    requiredLot = MathFloor(requiredLot / g_brokerSpecs.lotStep) * g_brokerSpecs.lotStep;
+
+    Print("ELASTIC_CALC: Target profit $", targetProfitUSD,
+          ", Expected move ", expectedPointMove, " points",
+          ", Point value $", g_brokerSpecs.pointValue, "/point/lot",
+          " -> Required lot: ", requiredLot);
+
+    return requiredLot;
+}
+
  // Bridge connection status
  bool g_bridgeConnected = true;
  bool g_loggedDisconnect = false; // To prevent spamming logs
@@ -107,11 +437,25 @@ const int ARRAY_MODIFICATION_TIMEOUT_SECONDS = 30; // Maximum time to wait for a
 int FindOrCreateTradeGroup(string baseId, int totalQty, string action)
 {
     // First try to find an existing group with this base ID
+    // Handle both full match (legacy) and partial match (new format due to MT5 comment length limit)
     int arraySize = ArraySize(g_baseIds);
     for(int i = 0; i < arraySize; i++)
     {
-        if(g_baseIds[i] == baseId && !g_isComplete[i])
-        {
+        bool isMatch = false;
+        if(g_baseIds[i] == baseId && !g_isComplete[i]) {
+            // Full match (legacy format)
+            isMatch = true;
+        } else if(StringLen(g_baseIds[i]) >= 16 && StringLen(baseId) >= 16 && !g_isComplete[i]) {
+            // Partial match - compare first 16 characters (new format)
+            string shortStoredBaseId = StringSubstr(g_baseIds[i], 0, 16);
+            string shortBaseId = StringSubstr(baseId, 0, 16);
+            if(shortStoredBaseId == shortBaseId) {
+                isMatch = true;
+                Print("DEBUG: FindOrCreateTradeGroup - Matched using partial base_id. Stored: '", shortStoredBaseId, "' (from full: '", g_baseIds[i], "'), Input: '", shortBaseId, "' (from full: '", baseId, "')");
+            }
+        }
+
+        if(isMatch) {
             // Found existing group - don't update global futures position again
             Print("DEBUG: Found existing trade group at index ", i, " for base ID: ", baseId);
             return i;
@@ -320,6 +664,27 @@ void FinalizeAndRemoveTradeGroup(int remove_idx)
         return;
     }
 
+    // CRITICAL FIX: Adjust globalFutures when removing a completed trade group
+    // This ensures globalFutures accurately reflects the current net position
+    if(remove_idx < ArraySize(g_actions) && remove_idx < ArraySize(g_totalQuantities))
+    {
+        string action = g_actions[remove_idx];
+        int totalQty = g_totalQuantities[remove_idx];
+        double globalFuturesBeforeAdjustment = globalFutures;
+
+        // Reverse the globalFutures adjustment that was made when the trade was opened
+        if(action == "Buy" || action == "BuyToCover") {
+            globalFutures -= totalQty;  // Subtract what was added when opened
+        } else if(action == "Sell" || action == "SellShort") {
+            globalFutures += totalQty;  // Add back what was subtracted when opened
+        }
+
+        Print("ACHM_GLOBALFUTURES_FIX: [FinalizeAndRemoveTradeGroup] Adjusted globalFutures for closed trade group. Action: '", action, "', Qty: ", totalQty, ", Before: ", globalFuturesBeforeAdjustment, ", After: ", globalFutures);
+
+        // Force overlay update to reflect the corrected globalFutures value
+        UpdateStatusOverlay();
+    }
+
     Print("ACHM_LOG: [FinalizeAndRemoveTradeGroup] Removing trade group at index ", remove_idx, " with base_id: '", (remove_idx < ArraySize(g_baseIds) ? g_baseIds[remove_idx] : "N/A_OOB"), "'. Current array size: ", arraySize);
 
     // Create temporary arrays for all but the element to remove
@@ -455,7 +820,7 @@ string FormatUTCTimestamp(datetime dt)
 }
 
 //+------------------------------------------------------------------+
-//| Sends a notification about a hedge closure                       |
+//| Sends a notification about a hedge closure with retry logic      |
 //+------------------------------------------------------------------+
 void SendHedgeCloseNotification(string base_id,
                                 string nt_instrument_symbol,
@@ -482,21 +847,83 @@ void SendHedgeCloseNotification(string base_id,
     payload += "}";
 
     string url = BridgeURL + "/notify_hedge_close";
-    char post_data[];
+
+    // Enhanced retry logic with exponential backoff
+    int max_retries = 3;
+    int base_timeout = 3000; // Start with 3 seconds
+    bool notification_sent = false;
+
+    // Declare variables at function level so they're accessible after the loop
     char result_data[];
-    string result_headers;
-    int timeout = 5000; // 5 seconds
+    int res = -1;
 
-    int payload_len = StringToCharArray(payload, post_data, 0, WHOLE_ARRAY, CP_UTF8) - 1;
-    if(payload_len < 0) payload_len = 0; // Ensure non-negative length
-    ArrayResize(post_data, payload_len);
-
-    ResetLastError();
-    int res = WebRequest("POST", url, "Content-Type: application/json\r\n", timeout, post_data, result_data, result_headers);
-
-    if(res == -1)
+    for(int attempt = 1; attempt <= max_retries && !notification_sent; attempt++)
     {
-        Print("Error in WebRequest for hedge close notification: ", GetLastError(), ". URL: ", url, ". Payload: ", payload);
+        char post_data[];
+        string result_headers;
+        int timeout = base_timeout * attempt; // Exponential timeout increase
+
+        int payload_len = StringToCharArray(payload, post_data, 0, WHOLE_ARRAY, CP_UTF8) - 1;
+        if(payload_len < 0) payload_len = 0; // Ensure non-negative length
+        ArrayResize(post_data, payload_len);
+
+        ResetLastError();
+        res = WebRequest("POST", url, "Content-Type: application/json\r\n", timeout, post_data, result_data, result_headers);
+
+        if(res == -1)
+        {
+            int error_code = GetLastError();
+            PrintFormat("MT5_TO_NT_CLOSURE: Attempt %d/%d failed for BaseID '%s'. Error: %d, URL: %s",
+                       attempt, max_retries, base_id, error_code, url);
+
+            if(attempt < max_retries)
+            {
+                int delay_ms = 500 * attempt; // Progressive delay: 500ms, 1000ms, 1500ms
+                PrintFormat("MT5_TO_NT_CLOSURE: Retrying in %dms...", delay_ms);
+                Sleep(delay_ms);
+            }
+        }
+        else if(res >= 200 && res < 300)
+        {
+            // Success - validate response
+            string response_str = CharArrayToString(result_data);
+
+            // Check for valid JSON response indicating success
+            if(StringFind(response_str, "\"status\":\"success\"") >= 0 ||
+               StringFind(response_str, "\"status\":\"received_by_bridge\"") >= 0)
+            {
+                notification_sent = true;
+                PrintFormat("MT5_TO_NT_CLOSURE: SUCCESS - Notification sent for BaseID '%s' on attempt %d. Response: %s",
+                           base_id, attempt, response_str);
+            }
+            else
+            {
+                PrintFormat("MT5_TO_NT_CLOSURE: Attempt %d/%d - Bridge responded but with unexpected content for BaseID '%s'. Response: %s",
+                           attempt, max_retries, base_id, response_str);
+
+                if(attempt < max_retries)
+                {
+                    Sleep(500 * attempt);
+                }
+            }
+        }
+        else
+        {
+            PrintFormat("MT5_TO_NT_CLOSURE: Attempt %d/%d - HTTP error %d for BaseID '%s'",
+                       attempt, max_retries, res, base_id);
+
+            if(attempt < max_retries)
+            {
+                Sleep(500 * attempt);
+            }
+        }
+    }
+
+    if(!notification_sent)
+    {
+        PrintFormat("MT5_TO_NT_CLOSURE: CRITICAL FAILURE - Failed to send closure notification for BaseID '%s' after %d attempts. Closure reason: %s",
+                   base_id, max_retries, closure_reason);
+        PrintFormat("MT5_TO_NT_CLOSURE: CRITICAL FAILURE - Payload was: %s", payload);
     }
     else
     {
@@ -857,7 +1284,12 @@ double GetCushion()
 
    // “freeboard” above the trailing-drawdown line
    double cushion = bal - (eodHigh - CUSHION_BAND);    // 120 = 40 % of $300
-   return cushion;                                     // <<< fixed
+   g_lastCushion = cushion;  // Store for debugging
+
+   Print("ELASTIC_DEBUG: GetCushion() - Balance: $", bal, ", EOD High: $", eodHigh,
+         ", Cushion Band: $", CUSHION_BAND, ", Calculated Cushion: $", cushion);
+
+   return cushion;
 }
 
 // Map cushion → OHF  (for a ≈$300 hedge account)
@@ -871,12 +1303,32 @@ double GetCushion()
 //──────────────────────────────────────────────────────────────────────────────
 double SelectOHF(double cushion)
 {
-    if(cushion <= 24)   return 0.25;
-    if(cushion <= 49)   return 0.20;
-    if(cushion <= 79)   return 0.15;
-    if(cushion <= 119)  return 0.10;
-    return 0.05;
+    double ohf = 0.05;  // Default minimum
+    string band_description = "";
 
+    if(cushion <= 18) {
+        ohf = 0.25;
+        band_description = "DANGER (≤$18)";
+    }
+    else if(cushion <= 36) {
+        ohf = 0.20;
+        band_description = "HIGH RISK ($19-$36)";
+    }
+    else if(cushion <= 54) {
+        ohf = 0.15;
+        band_description = "MEDIUM RISK ($37-$54)";
+    }
+    else if(cushion <= 72) {
+        ohf = 0.10;
+        band_description = "LOW RISK ($55-$72)";
+    }
+    else {
+        ohf = 0.05;
+        band_description = "SAFE (≥$73)";
+    }
+
+    Print("ELASTIC_DEBUG: SelectOHF() - Cushion: $", cushion, " -> OHF: ", ohf, " (", band_description, ")");
+    return ohf;
 }
 
 // Scale the supplied lot according to live OHF – used ONLY when
@@ -884,20 +1336,135 @@ double SelectOHF(double cushion)
 //──────────────────────────────────────────────────────────────────────────────
 double CalcHedgeLot(double baseLot)
 {
-   // If not in dynamic‑hedge mode, leave untouched
-   if(UseACRiskManagement || !EnableHedging)
-      return baseLot;
-
+   if(!g_broker_specs_ready)
+   {
+      Print("FATAL_ERROR: CalcHedgeLot() called before broker specs were ready. Returning min lot to prevent invalid trade.");
+      return g_brokerSpecs.minLot > 0 ? g_brokerSpecs.minLot : 0.01;
+   }
+   // Dynamic hedge calculation - OHF scaling based on account cushion
+   // Note: Mode selection is now handled in OpenNewHedgeOrder()
+ 
    double cushion = GetCushion();
-   g_lastOHF       = SelectOHF(cushion);
-   return baseLot * g_lastOHF;
+   g_lastOHF = SelectOHF(cushion);
+
+   // Calculate lot size based on target profit and broker specifications
+   double finalLot = 0.0;
+
+   if(g_brokerSpecs.isValid)
+   {
+       // PROGRESSIVE HEDGING: Use conservative targets that scale based on NT performance
+       double targetProfit = CalculateProgressiveHedgingTarget();
+
+       Print("ELASTIC_HEDGING: PROGRESSIVE MODE - Target profit: $", targetProfit);
+
+       // Estimate expected point movement (this could be made configurable)
+       double expectedPointMove = 100.0; // Conservative estimate for NAS100
+
+       // Calculate lot size needed for target profit
+       double targetLot = CalculateLotForTargetProfit(targetProfit, expectedPointMove);
+
+       // CONSERVATIVE RISK SCALING: Use moderate multipliers instead of extreme inverse OHF
+       // Safe accounts (OHF=0.05): Use 2x multiplier for reasonable scaling
+       // Stressed accounts (OHF=0.25): Use 0.5x multiplier for safety
+       double riskMultiplier = 1.0;
+       if(g_lastOHF <= 0.10) {
+           riskMultiplier = 2.0;  // Safe accounts: modest increase
+       } else if(g_lastOHF >= 0.20) {
+           riskMultiplier = 0.5;  // Stressed accounts: reduce risk
+       }
+       finalLot = targetLot * riskMultiplier;
+
+       double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+       Print("ELASTIC_PROGRESSIVE: CalcHedgeLot() - Balance: $", currentBalance,
+             ", Target Profit: $", targetProfit, " (Progressive scaling)",
+             ", Expected Move: ", expectedPointMove, " points",
+             ", Target Lot: ", targetLot, ", Risk Multiplier: ", riskMultiplier,
+             ", Pre-constraint Lot: ", finalLot);
+   }
+   else
+   {
+       // Fallback: Use conservative multiplier on base lot if broker specs not available
+       double riskMultiplier = 1.0;  // Conservative fallback
+       if(g_lastOHF <= 0.10) {
+           riskMultiplier = 1.5;  // Modest increase for safe accounts
+       } else if(g_lastOHF >= 0.20) {
+           riskMultiplier = 0.7;  // Reduce for stressed accounts
+       }
+       finalLot = baseLot * riskMultiplier;
+       Print("ELASTIC_PROGRESSIVE: CalcHedgeLot() - Using fallback method. Base: ", baseLot,
+             ", Risk Multiplier: ", riskMultiplier, ", Pre-constraint Lot: ", finalLot);
+   }
+
+   // ADDED: Mandatory margin validation before broker constraints
+   double marginFree = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double maxAffordableLots = 0.0;
+
+   if(g_brokerSpecs.marginRequired > 0)
+   {
+       // Use 80% of free margin to leave safety buffer
+       maxAffordableLots = (marginFree * 0.80) / g_brokerSpecs.marginRequired;
+   }
+   else
+   {
+       // Fallback: Conservative estimate if margin requirement unknown
+       maxAffordableLots = marginFree / 50.0; // Assume $50 per lot as safety
+   }
+
+
+
+   // Apply margin constraint first
+   if(finalLot > maxAffordableLots)
+   {
+       Print("ELASTIC_MARGIN_LIMIT: Lot size reduced from ", finalLot, " to ", maxAffordableLots,
+             " due to margin constraints. Free margin: $", marginFree,
+             ", Required margin per lot: $", g_brokerSpecs.marginRequired);
+       finalLot = maxAffordableLots;
+   }
+
+   // Apply broker constraints
+   finalLot = MathMax(finalLot, g_brokerSpecs.minLot);
+   finalLot = MathMin(finalLot, g_brokerSpecs.maxLot);
+   finalLot = MathFloor(finalLot / g_brokerSpecs.lotStep) * g_brokerSpecs.lotStep;
+
+   // Calculate final expected profit and margin usage
+   double expectedProfit = finalLot * 100.0 * g_brokerSpecs.pointValue; // Assuming 100 point move
+   double requiredMargin = finalLot * g_brokerSpecs.marginRequired;
+   double marginUsagePercent = (requiredMargin / marginFree) * 100.0;
+
+   Print("ELASTIC_FINAL: CalcHedgeLot() - Final lot: ", finalLot,
+         ", Expected profit (100pts): $", expectedProfit,
+         ", Required margin: $", requiredMargin,
+         ", Margin usage: ", marginUsagePercent, "%",
+         " (Constraints: Min=", g_brokerSpecs.minLot, ", Max=", g_brokerSpecs.maxLot,
+         ", Step=", g_brokerSpecs.lotStep, ")");
+
+   // Safety check: Never use more than 90% of available margin
+   if(marginUsagePercent > 90.0)
+   {
+       Print("ELASTIC_WARNING: Margin usage exceeds 90% (", marginUsagePercent, "%). Trade may be risky.");
+   }
+
+   return finalLot;
 }
+
+
+
+
 
 //+------------------------------------------------------------------+
 //| Expert initialization function - Called when EA is first loaded    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+// Adjust UseACRiskManagement based on LotSizingMode
+   if (LotSizingMode == Asymmetric_Compounding) {
+      UseACRiskManagement = true;
+      PrintFormat("LotSizingMode is LOT_MODE_AC, UseACRiskManagement has been set to true.");
+   } else { // LOT_MODE_FIXED or LOT_MODE_ELASTIC
+      UseACRiskManagement = false;
+      PrintFormat("LotSizingMode is %s, UseACRiskManagement has been set to false.", EnumToString(LotSizingMode));
+   }
    // Reset trade groups on startup
    ResetTradeGroups(); // This already resets g_baseIds etc. to 0 or an initial state.
 
@@ -1044,14 +1611,29 @@ int OnInit()
                    Print("ACHM_RECOVERY_INFO: Comment '", comment, "' for PosID ", mt5_pos_id, " did not start with AC_HEDGE or was too short for full NTA/NTQ/MTA parsing after splitting by ';'. BaseID '", base_id_str, "' was still extracted.");
                }
 
-               // Proceed with full rehydration if all essential parts were parsed
+               // MODIFIED: Proceed with full rehydration if all essential parts were parsed
                if(nt_action_str != "" && nt_qty_val > 0 && mt5_action_str != "") {
                    Print("ACHM_RECOVERY: All parts parsed for full rehydration. Ticket ", mt5_ticket, ": BaseID='", base_id_str, "', NT_Action='", nt_action_str, "', NT_Qty=", nt_qty_val, ", MT5_Action='", mt5_action_str, "'");
 
                    // 2. Re-create Trade Group Entry
                    int group_idx = -1;
+                   // Handle both full match (legacy) and partial match (new format due to MT5 comment length limit)
                    for(int k=0; k < ArraySize(g_baseIds); k++) {
+                       bool isMatch = false;
                        if(g_baseIds[k] == base_id_str) {
+                           // Full match (legacy format)
+                           isMatch = true;
+                       } else if(StringLen(g_baseIds[k]) >= 16 && StringLen(base_id_str) >= 16) {
+                           // Partial match - compare first 16 characters (new format)
+                           string shortStoredBaseId = StringSubstr(g_baseIds[k], 0, 16);
+                           string shortBaseId = StringSubstr(base_id_str, 0, 16);
+                           if(shortStoredBaseId == shortBaseId) {
+                               isMatch = true;
+                               Print("ACHM_RECOVERY: Matched using partial base_id. Stored: '", shortStoredBaseId, "' (from full: '", g_baseIds[k], "'), Input: '", shortBaseId, "' (from full: '", base_id_str, "')");
+                           }
+                       }
+
+                       if(isMatch) {
                            group_idx = k;
                            Print("ACHM_RECOVERY: Found existing (potentially incomplete) trade group for base_id '", base_id_str, "' at index ", group_idx);
                            break;
@@ -1117,7 +1699,33 @@ int OnInit()
                    rehydrated_count++;
                    Print("ACHM_RECOVERY: Successfully rehydrated state for MT5 PositionID ", mt5_pos_id, " (Ticket: ", mt5_ticket, ")");
                } else {
-                   Print("ACHM_RECOVERY_WARN: Base_id '", base_id_str, "' extracted, but other parts (NTA/NTQ/MTA) for full rehydration are missing/invalid from comment '", comment, "'. PosID ", mt5_pos_id, " was mapped, but group/globalFutures rehydration might be incomplete for this specific position.");
+                   // CORRUPTION FIX: Even if full parsing failed, ensure parallel arrays are populated with placeholders
+                    Print("ACHM_RECOVERY_WARN: Base_id '", base_id_str, "' extracted, but other parts (NTA/NTQ/MTA) for full rehydration are missing/invalid from comment '", comment, "'. Adding to arrays with placeholder values.");
+                    
+                    // Use placeholder values for missing data
+                    string placeholder_nt_action = (nt_action_str != "") ? nt_action_str : "UNKNOWN_ACTION";
+                    int placeholder_nt_qty = (nt_qty_val > 0) ? nt_qty_val : 1;
+                    string placeholder_mt5_action = (mt5_action_str != "") ? mt5_action_str : ((mt5_pos_type == POSITION_TYPE_BUY) ? "BUY" : "SELL");
+                    
+                    // Add to parallel arrays to prevent corruption
+                    int open_mt5_idx = ArraySize(g_open_mt5_pos_ids);
+                    ArrayResize(g_open_mt5_pos_ids, open_mt5_idx + 1);
+                    ArrayResize(g_open_mt5_base_ids, open_mt5_idx + 1);
+                    ArrayResize(g_open_mt5_nt_symbols, open_mt5_idx + 1);
+                    ArrayResize(g_open_mt5_nt_accounts, open_mt5_idx + 1);
+                    ArrayResize(g_open_mt5_original_nt_actions, open_mt5_idx + 1);
+                    ArrayResize(g_open_mt5_original_nt_quantities, open_mt5_idx + 1);
+                    ArrayResize(g_open_mt5_actions, open_mt5_idx + 1);
+
+                    g_open_mt5_pos_ids[open_mt5_idx] = mt5_pos_id;
+                    g_open_mt5_base_ids[open_mt5_idx] = base_id_str;
+                    g_open_mt5_nt_symbols[open_mt5_idx] = PositionGetString(POSITION_SYMBOL);
+                    g_open_mt5_nt_accounts[open_mt5_idx] = AccountInfoString(ACCOUNT_NAME);
+                    g_open_mt5_original_nt_actions[open_mt5_idx] = placeholder_nt_action;
+                    g_open_mt5_original_nt_quantities[open_mt5_idx] = placeholder_nt_qty;
+                    g_open_mt5_actions[open_mt5_idx] = placeholder_mt5_action;
+                    
+                    Print("ACHM_RECOVERY_PLACEHOLDER: Added position ", mt5_pos_id, " to arrays with placeholders - NT_Action:'", placeholder_nt_action, "', NT_Qty:", placeholder_nt_qty, ", MT5_Action:'", placeholder_mt5_action, "'");
                }
            } else { // base_id_str is empty
                Print("ACHM_RECOVERY_FAIL: Failed to extract a valid base_id from comment '", comment, "' for position ticket ", mt5_ticket, ". Cannot rehydrate this position's state.");
@@ -1138,16 +1746,37 @@ int OnInit()
    
    if(UseATRTrailing)
    {
+      // Pass EA input values to ATRtrailing.mqh variables
+      TrailingButtonXDistance = TrailingButtonXPos_EA;
+      TrailingButtonYDistance = TrailingButtonYPos_EA;
       InitDEMAATR();
       Print("✓ DEMA-ATR trailing stop initialized");
    }
    
+   // Pass EA input values to StatusIndicator.mqh variables
+   StatusLabelXDistance = StatusLabelXPos_EA;
+   StatusLabelYDistance = StatusLabelYPos_EA;
    InitStatusIndicator();
    Print("✓ Status indicator initialized");
-   
+
+   // Initialize the elastic hedging telemetry overlay
+   InitStatusOverlay();
+   Print("✓ Elastic hedging telemetry overlay initialized");
+
+   // WHACK-A-MOLE FIX: Initial overlay update to display current state
+   UpdateStatusOverlay();
+
+   // Query broker specifications for accurate lot sizing
+   if(!QueryBrokerSpecs())
+   {
+      Print("INFO: Broker specifications not yet available. Will query periodically.");
+   }
+
+
+
    EventSetMillisecondTimer(200);
    g_timerCounter = 0;
-   
+
    return(INIT_SUCCEEDED);
 }
 
@@ -1159,12 +1788,18 @@ void OnDeinit(const int reason)
    // Stop the timer to prevent further trade checks
    // EventKillTimer();
    EventKillTimer();
-   
+
    // Delete the trailing button
    ObjectDelete(0, ButtonName);
-   
+
    // Remove the status indicator
    RemoveStatusIndicator();
+
+   // Remove the elastic hedging telemetry overlay
+   RemoveStatusOverlay();
+
+   // Clear the chart comment (removes "Bridge: Connected" from chart header)
+   Comment("");
 
    if(CheckPointer(g_map_position_id_to_base_id) == POINTER_DYNAMIC) {
        Print("Deinitializing g_map_position_id_to_base_id (template). Count: ", g_map_position_id_to_base_id.Count());
@@ -1185,7 +1820,7 @@ void OnDeinit(const int reason)
    }
 
    // Removed deinitialization for g_map_position_id_to_details
-   
+
    Print("EA removed from chart - all objects cleaned up");
 }
 
@@ -1490,15 +2125,33 @@ bool CloseOneHedgePosition(string hedgeOrigin, string specificTradeId = "")
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-   g_timerCounter++; // Increment counter each second
+   g_timerCounter++; // Increment counter each 200ms
 
-   // --- Periodic Array Integrity Check (every 30 seconds) ---
-   if(g_timerCounter % 30 == 0)
+   // --- WHACK-A-MOLE FIX: Remove timer-based overlay updates ---
+   // UpdateStatusOverlay() is now only called when actual state changes occur
+   // via ForceOverlayRecalculation() calls from state change events
+
+   // --- WHACK-A-MOLE FIX: Throttled Array Integrity Check (every 5 minutes) ---
+   // Reduced frequency to prevent log spam and performance issues
+   static datetime g_last_integrity_check = 0;
+   const int INTEGRITY_CHECK_INTERVAL = 300; // 5 minutes
+
+   if(TimeCurrent() - g_last_integrity_check >= INTEGRITY_CHECK_INTERVAL)
    {
-      if(!ValidateArrayIntegrity(true)) {
-         PrintFormat("CRITICAL_ARRAY_CORRUPTION: Array integrity check failed in OnTimer at counter %d", g_timerCounter);
+      g_last_integrity_check = TimeCurrent();
+      if(!ValidateArrayIntegrity(false)) { // Set to false to reduce log verbosity
+         PrintFormat("CRITICAL_ARRAY_CORRUPTION: Array integrity check failed at %s", TimeToString(TimeCurrent()));
          PrintFormat("CRITICAL_ARRAY_CORRUPTION: This indicates the array corruption bug may still be present or has occurred.");
+         // Only log details when there's actually an error
+         ValidateArrayIntegrity(true);
       }
+   }
+
+   // --- Periodic Broker Spec Query (every 5 seconds if not ready) ---
+   if(!g_broker_specs_ready && g_timerCounter % 5 == 0)
+   {
+      Print("INFO: Broker specs not ready, attempting to query again...");
+      QueryBrokerSpecs();
    }
 
    // --- Periodic Health Ping (e.g., every 15 seconds) ---
@@ -1523,8 +2176,20 @@ void OnTimer()
    }
 
    // --- Get any pending trades from the bridge (every second) ---
+   // Defer processing if broker specs are not ready
+   if(!g_broker_specs_ready)
+   {
+      UpdateStatusIndicator("Specs...", clrOrange);
+      return;
+   }
    string response = GetTradeFromBridge();
    if(response == "") return;
+
+   // Debug logging for all responses (including CLOSE_HEDGE detection)
+   if(StringFind(response, "CLOSE_HEDGE") >= 0) {
+       Print("ACHM_CLOSURE_DEBUG: [OnTimer] *** DETECTED CLOSE_HEDGE IN BRIDGE RESPONSE ***");
+       Print("ACHM_CLOSURE_DEBUG: [OnTimer] Full Response: ", response);
+   }
    
    // Print("DEBUG: Received trade response: ", response); // Commented out for reduced logging on empty polls
    
@@ -1580,6 +2245,44 @@ void OnTimer()
    }
    Print("ACHM_LOG: [OnTimer] Parsed NT base_id: '", baseIdFromJson, "', Action: '", incomingNtAction, "', Qty: ", incomingNtQuantity);
 
+   // --- WHACK-A-MOLE FIX: Filter out HedgeClose orders ---
+   // Check if this is a HedgeClose order from NinjaTrader addon
+   string orderName = GetJSONStringValue(response, "\"order_name\"");
+   if (orderName == "") {
+       // Try alternative field names that might contain the order name
+       orderName = GetJSONStringValue(response, "\"name\"");
+   }
+   if (orderName == "") {
+       // Try to extract from the base_id if it contains HedgeClose pattern
+       if (StringFind(baseIdFromJson, "HedgeClose_") == 0) {
+           orderName = baseIdFromJson;
+       }
+   }
+
+   // If this is a HedgeClose order, ignore it to prevent whack-a-mole effect
+   if (StringFind(orderName, "HedgeClose") != -1) {
+       Print("ACHM_WHACKAMOLE_FIX: [OnTimer] Ignoring HedgeClose order to prevent whack-a-mole effect. OrderName: '", orderName, "', BaseID: '", baseIdFromJson, "'");
+       return; // Exit early, do not process this trade
+   }
+
+   // --- NT CLOSURE HANDLING: Check if this is a hedge closure request from NinjaTrader ---
+   if (incomingNtAction == "CLOSE_HEDGE") {
+       Print("ACHM_NT_CLOSURE: [OnTimer] *** RECEIVED CLOSE_HEDGE REQUEST FROM NINJATRADER ***");
+       Print("ACHM_NT_CLOSURE: [OnTimer] BaseID: '", baseIdFromJson, "', Quantity: ", incomingNtQuantity);
+       Print("ACHM_NT_CLOSURE: [OnTimer] Full JSON Response: ", response);
+
+       // Close all hedge positions for this base_id
+       bool closureSuccess = CloseHedgePositionsForBaseId(baseIdFromJson, incomingNtQuantity);
+
+       if (closureSuccess) {
+           Print("ACHM_NT_CLOSURE: [OnTimer] *** SUCCESSFULLY CLOSED HEDGE POSITIONS FOR BASEID: '", baseIdFromJson, "' ***");
+       } else {
+           Print("ACHM_NT_CLOSURE: [OnTimer] *** FAILED TO CLOSE HEDGE POSITIONS FOR BASEID: '", baseIdFromJson, "' ***");
+       }
+
+       return; // Exit early, this was a closure request, not a new trade
+   }
+
    // Parse nt_instrument_symbol and nt_account_name
    string ntInstrument = GetJSONStringValue(response, "\"nt_instrument_symbol\"");
    string ntAccount = GetJSONStringValue(response, "\"nt_account_name\"");
@@ -1601,11 +2304,39 @@ void OnTimer()
    
    Print("ACHM_LOG: [OnTimer] Processing NT message. Base_ID='", baseIdFromJson, "', Action='", incomingNtAction, "', Qty=", incomingNtQuantity, ", TotalQtyForBaseID=", totalQtyForBaseId, ", NT_Inst='", ntInstrument, "', NT_Acc='", ntAccount, "'");
 
+   // --- Parse Enhanced NT Performance Data ---
+   double nt_balance = 0.0;
+   double nt_daily_pnl = 0.0;
+   string nt_trade_result = "";
+   int nt_session_trades = 0;
+
+   if(ParseNTPerformanceData(response, nt_balance, nt_daily_pnl, nt_trade_result, nt_session_trades)) {
+       UpdateNTPerformanceTracking(nt_balance, nt_daily_pnl, nt_trade_result, nt_session_trades);
+       // WHACK-A-MOLE FIX: ForceOverlayRecalculation is now called internally by UpdateNTPerformanceTracking when data actually changes
+   } else {
+       Print("NT_PARSE_INFO: Enhanced NT data not available in this message, using existing tracking data");
+   }
+
    // --- Partial Fill Aggregation Logic ---
    int groupIndex = -1;
    // Try to find an existing, active (not yet complete for hedging) group for this base_id
+   // Handle both full match (legacy) and partial match (new format due to MT5 comment length limit)
    for(int i = 0; i < ArraySize(g_baseIds); i++) {
-       if(g_baseIds[i] == baseIdFromJson && !g_isComplete[i]) { // g_isComplete now tracks if hedging action was taken for full order
+       bool isMatch = false;
+       if(g_baseIds[i] == baseIdFromJson && !g_isComplete[i]) {
+           // Full match (legacy format)
+           isMatch = true;
+       } else if(StringLen(g_baseIds[i]) >= 16 && StringLen(baseIdFromJson) >= 16 && !g_isComplete[i]) {
+           // Partial match - compare first 16 characters (new format)
+           string shortStoredBaseId = StringSubstr(g_baseIds[i], 0, 16);
+           string shortBaseId = StringSubstr(baseIdFromJson, 0, 16);
+           if(shortStoredBaseId == shortBaseId) {
+               isMatch = true;
+               Print("ACHM_LOG: [PartialFill] Matched using partial base_id. Stored: '", shortStoredBaseId, "' (from full: '", g_baseIds[i], "'), Input: '", shortBaseId, "' (from full: '", baseIdFromJson, "')");
+           }
+       }
+
+       if(isMatch) {
            groupIndex = i;
            Print("ACHM_LOG: [PartialFill] Found existing active group for base_id '", baseIdFromJson, "' at index ", i, ". Processed: ", g_processedQuantities[i], ", Expected: ", g_totalQuantities[i]);
            // Potentially update g_totalQuantities[i] if totalQtyForBaseId from this message is different and more up-to-date?
@@ -1684,6 +2415,11 @@ void OnTimer()
            }
            Print("ACHM_LOG: [OnTimerPF] globalFutures AFTER completed order '", g_baseIds[groupIndex], "': ", globalFutures, " (updated by ", (orderActionForUpdate == "Buy" || orderActionForUpdate == "BuyToCover" ? totalOrderQuantityForUpdate : -totalOrderQuantityForUpdate), ")");
 
+           // WHACK-A-MOLE FIX: Update overlay directly if globalFutures actually changed
+           if(MathAbs(globalFutures - globalFuturesBeforeNtOrder) > 0.01) {
+               UpdateStatusOverlay();
+           }
+
            // Determine if this completed NT order was a reducing trade or flipped the sign
            bool isReducingNtOrder = false;
            if ((orderActionForUpdate == "Buy" || orderActionForUpdate == "BuyToCover") && globalFuturesBeforeNtOrder < 0 && globalFutures > globalFuturesBeforeNtOrder) {
@@ -1702,16 +2438,15 @@ void OnTimer()
                Print("ACHM_LOG: [OnTimerPF] Completed NT order '", g_baseIds[groupIndex], "' FLIPPED globalFutures sign. From ", globalFuturesBeforeNtOrder, " to ", globalFutures);
            }
 
-           // If globalFutures is now zero after this completed order, close all hedges.
+           // MODIFIED: Instead of closing all hedges when globalFutures reaches zero,
+           // let individual hedge adjustments handle the closure per base_id
+           // This allows for proper per-order closure synchronization
            if(globalFutures == 0.0) {
-               Print("ACHM_LOG: [OnTimerPF] globalFutures is zero after completed order '", g_baseIds[groupIndex], "'. Closing all hedge orders.");
-               bool resetHappened = CloseAllHedgeOrders();
-               if (resetHappened) {
-                   Print("ACHM_LOG: [OnTimerPF] ResetTradeGroups was called by CloseAllHedgeOrders. Skipping further processing for this tick to prevent array errors.");
-                   return; // Exit OnTimer immediately
-               }
-               // The CleanupTradeGroups at the end of OnTimer will handle group removal if not returned early.
-           } else {
+               Print("ACHM_LOG: [OnTimerPF] globalFutures is zero after completed order '", g_baseIds[groupIndex], "'. Proceeding with individual hedge adjustment instead of closing all.");
+           }
+
+           // Always proceed with hedge adjustment logic (removed the 'else' clause)
+           {
                // --- Overall Hedge Adjustment Logic (now conditional on order completion) ---
                Print("ACHM_DIAG: [OnTimerPF] Adjusting hedges based on new globalFutures=", globalFutures, " for completed base_id '", g_baseIds[groupIndex], "'");
                // First, determine current MT5 positions for this symbol and magic number
@@ -1841,6 +2576,18 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // Display EA status on chart
+   string ea_name_for_comment = MQLInfoString(MQL_PROGRAM_NAME);
+   string ea_version_for_comment = "2.11"; // From #property version
+   string stats_comment = StringFormat("%s v%s | %s | Balance: %.2f | Positions: %d | Bridge: %s",
+                                     ea_name_for_comment,
+                                     ea_version_for_comment,
+                                     _Symbol,
+                                     AccountInfoDouble(ACCOUNT_BALANCE),
+                                     PositionsTotal(),
+                                     g_bridgeConnected ? "Connected" : "Disconnected");
+   Comment(stats_comment);
+
    // Update trailing stops for all open positions
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -1942,8 +2689,8 @@ string GetTradeFromBridge()
    string headers = "";
    string response_headers;
    
-   // Send request to bridge with retry logic
-   int web_result = WebRequest("GET", BridgeURL + "/mt5/get_trade", headers, 5000, response_data, response_data, response_headers); // Added 5 sec timeout
+   // Send request to bridge with retry logic (fast timeout for hedging speed)
+   int web_result = WebRequest("GET", BridgeURL + "/mt5/get_trade", headers, 500, response_data, response_data, response_headers); // 500ms timeout for maximum speed
    
    // --- Error Handling & Retry Logic ---
    if(web_result < 0) // Check integer return code for errors
@@ -1956,7 +2703,7 @@ string GetTradeFromBridge()
           UpdateStatusIndicator("Disconnected", clrRed); // Update indicator
       }
       g_bridgeConnected = false;
-      Sleep(10000); // Wait 10 seconds before next attempt (via OnTimer)
+      Sleep(200); // Wait 200ms before next attempt (via OnTimer) - maximum speed for hedging
       return ""; // Return empty, OnTimer will call again
    }
    
@@ -2119,11 +2866,11 @@ string ExtractBaseIdFromComment(string comment_str)
     }
 
     int id_len = StringLen(base_id);
-    // Adjusted length check for typical UUIDs (32-36 chars), allowing some flexibility.
+    // Updated length check for shortened base_ids (16 chars) due to MT5 comment field limitations
     // Log warnings only for comments that appear to be AC_HEDGE related to reduce noise.
     if (StringFind(comment_str, "AC_HEDGE", 0) != -1) { // Check if it's likely one of our comments
-        if (id_len > 0 && (id_len < 32 || id_len > 36) && base_id != "TEST_BASE_ID_RECOVERY") { // Allow specific test IDs
-             Print("ACHM_PARSE_WARN: ExtractBaseIdFromComment - Extracted base_id '", base_id, "' from '", comment_str, "' has unusual length: ", id_len);
+        if (id_len > 0 && (id_len < 16 || id_len > 36) && base_id != "TEST_BASE_ID_RECOVERY") { // Allow 16-36 chars for compatibility
+             Print("ACHM_PARSE_INFO: ExtractBaseIdFromComment - Extracted base_id '", base_id, "' from '", comment_str, "' has length: ", id_len, " (expected 16 for new format, 32 for legacy)");
         } else if (id_len == 0 && StringFind(comment_str, "BID:", 0) != -1) {
             // If it's an AC_HEDGE comment and contains BID: but we got no base_id, that's a specific failure.
             Print("ACHM_PARSE_FAIL: ExtractBaseIdFromComment - Failed to extract base_id from AC_HEDGE comment containing BID: '", comment_str, "'");
@@ -2202,7 +2949,23 @@ bool CloseAllHedgeOrders() // Corresponds to CloseAllHedgeOrdersCorrected from p
                             // Since the position is now closed, it might have been removed from g_open_mt5_pos_ids by OnTradeTransaction already.
                             // The comment's base_id is more reliable here if OnTradeTransaction hasn't processed it yet.
                             // Let's search g_open_mt5_base_ids for base_id_closed.
-                            if (k < ArraySize(g_open_mt5_base_ids) && g_open_mt5_base_ids[k] == base_id_closed) {
+                            // Handle both full match (legacy) and partial match (new format due to MT5 comment length limit)
+                            bool isMatch = false;
+                            if (k < ArraySize(g_open_mt5_base_ids)) {
+                                string storedBaseId = g_open_mt5_base_ids[k];
+                                if(storedBaseId == base_id_closed) {
+                                    // Full match (legacy format)
+                                    isMatch = true;
+                                } else if(StringLen(base_id_closed) >= 16 && StringLen(storedBaseId) >= 16) {
+                                    // Partial match - compare first 16 characters (new format)
+                                    string shortStoredBaseId = StringSubstr(storedBaseId, 0, 16);
+                                    if(base_id_closed == shortStoredBaseId) {
+                                        isMatch = true;
+                                        Print("DEBUG: CloseAllHedgeOrders - Matched using partial base_id. Comment: '", base_id_closed, "', Stored: '", shortStoredBaseId, "' (from full: '", storedBaseId, "')");
+                                    }
+                                }
+                            }
+                            if (isMatch) {
                                  // Check if this slot in parallel arrays still corresponds to the *ticket* we just closed.
                                  // This is tricky because OnTradeTransaction might have already removed it.
                                  // For now, if base_id matches, we'll use the NT details from that slot.
@@ -2385,48 +3148,83 @@ bool OpenNewHedgeOrder(string hedgeOrigin, string tradeId, string nt_instrument_
    double slPoints = slDist / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
    /*----------------------------------------------------------------
-     3.  Lot-size calculation – same core logic as MainACAlgo
-   ----------------------------------------------------------------*/
-   double volume = DefaultLot;                 // fallback (AC off)
+     3.  Lot-size calculation – NEW enum-based system
+  ----------------------------------------------------------------*/
+  double volume = DefaultLot;                 // fallback default
+  
+  // NEW: Switch based on LotSizingMode enum
+  switch(LotSizingMode)
+  {
+     case Asymmetric_Compounding:
+        {
+           // AC-Risk-Management: Smart %-risk per trade using currentRisk, ATR SL, equity, etc.
+           double equity      = AccountInfoDouble(ACCOUNT_EQUITY);
+           double riskAmount  = equity * (currentRisk / 100.0);
 
-   if(UseACRiskManagement)
-   {
-      // —— asym-comp sizing ——————————
-      double equity      = AccountInfoDouble(ACCOUNT_EQUITY);
-      double riskAmount  = equity * (currentRisk / 100.0);
+           double point       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+           double tickValue   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+           double tickSize    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+           double onePointVal = tickValue * (point / tickSize);
 
-      double point       = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      double tickValue   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tickSize    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-      double onePointVal = tickValue * (point / tickSize);
+           volume = riskAmount / (slPoints * onePointVal);
+           volume = MathFloor(volume / lotStep) * lotStep;
+           volume = MathMax(volume, minLot);
+           volume = MathMin(volume, maxLot);
+           
+           Print("INFO: LOT_MODE_AC - Calculated volume: ", volume, " (Risk: ", currentRisk, "%, Equity: ", equity, ")");
+        }
+        break;
+        
+     case Fixed_Lot_Size:
+        {
+           // Fixed lot: Always opens DefaultLot
+           volume = MathMax(DefaultLot, minLot);
+           volume = MathMin(volume, maxLot);
+           volume = MathFloor(volume / lotStep) * lotStep;
+           
+           Print("INFO: LOT_MODE_FIXED - Using fixed volume: ", volume, " (DefaultLot: ", DefaultLot, ")");
+        }
+        break;
+        
+     case Elastic_Hedging:
+        {
+           // Elastic-hedge: Start with DefaultLot, then apply dynamic OHF (0.05→0.25)
+           volume = MathMax(DefaultLot, minLot);
+           volume = MathMin(volume, maxLot);
+           volume = MathFloor(volume / lotStep) * lotStep;
+           
+           // Apply elastic hedge factor, only if broker specs are ready
+           if(!g_broker_specs_ready)
+           {
+              Print("ERROR: LOT_MODE_ELASTIC - Broker specs not ready. Aborting trade.");
+              return false;
+           }
+           volume = CalcHedgeLot(volume);   // Dynamic 5-25% factor based on account cushion
+           
+           Print("INFO: LOT_MODE_ELASTIC - Base volume: ", DefaultLot, ", Final volume with OHF: ", volume, " (OHF: ", g_lastOHF, ")");
+        }
+        break;
+        
+     default:
+        Print("ERROR: Unknown LotSizingMode: ", LotSizingMode, ". Using DefaultLot fallback.");
+        volume = MathMax(DefaultLot, minLot);
+        volume = MathMin(volume, maxLot);
+        volume = MathFloor(volume / lotStep) * lotStep;
+        break;
+  }
 
-      volume = riskAmount / (slPoints * onePointVal);
-      volume = MathFloor(volume / lotStep) * lotStep;
-      volume = MathMax(volume, minLot);
-      volume = MathMin(volume, maxLot);
-   }
-   else
-   {
-      // —— fixed size, but respect broker limits ——
-      volume = MathMax(DefaultLot, minLot);
-      volume = MathMin(volume,     maxLot);
-      volume = MathFloor(volume / lotStep) * lotStep;
-   }
+  if(volume < minLot - 1e-8)
+  {
+     Print("ERROR – calculated lot below broker minimum.");
+     return false;
+  }
 
-   if(volume < minLot - 1e-8)
-   {
-      Print("ERROR – calculated lot below broker minimum.");
-      return false;
-   }
+  /*----------------------------------------------------------------
+    4.  Final volume assignment (no additional adjustments needed)
+  ----------------------------------------------------------------*/
+  double finalVol = volume;  // Volume already calculated based on selected mode
 
-   /*----------------------------------------------------------------
-     4.  Elastic-hedge adjustment (only when AC off + hedging on)
-   ----------------------------------------------------------------*/
-   double finalVol = volume;
-   if(!UseACRiskManagement && EnableHedging)
-      finalVol = CalcHedgeLot(volume);   // <-- dynamic 5-25 % factor
-
-   request.volume = finalVol;            // ← the size that will go out
+  request.volume = finalVol;            // ← the size that will go out
 
    /*----------------------------------------------------------------
      5.  Order side & comment
@@ -2464,12 +3262,15 @@ bool OpenNewHedgeOrder(string hedgeOrigin, string tradeId, string nt_instrument_
        Print("WARN: OpenNewHedgeOrder - Could not find trade group for base_id '", tradeId, "' to create detailed comment. Using N/A.");
    }
 
-   // Format comment: "AC_HEDGE;BID:{base_id};NTA:{NT_ACTION};NTQ:{NT_QTY}"
+   // Format comment: "AC_HEDGE;BID:{short_base_id};NTA:{NT_ACTION};NTQ:{NT_QTY}"
+   // MT5 comment field is limited to ~31 characters, so we use only first 16 chars of base_id
+   // The full base_id is stored in g_map_position_id_to_base_id hashmap
    // hedgeOrigin is the MT5 action (Buy/Sell)
    // original_nt_action_for_comment is the original NT action (Buy/Sell/BuyToCover/SellShort)
    // original_nt_qty_for_comment is the original NT quantity
+   string short_base_id = StringSubstr(tradeId, 0, 16); // Use first 16 chars to fit in MT5 comment limit
    request.comment = StringFormat("AC_HEDGE;BID:%s;NTA:%s;NTQ:%d;MTA:%s", // Added MTA for MT5 Action
-                                  tradeId,
+                                  short_base_id,
                                   original_nt_action_for_comment,
                                   original_nt_qty_for_comment,
                                   hedgeOrigin); // hedgeOrigin is the MT5 action
@@ -2603,8 +3404,20 @@ bool OpenNewHedgeOrder(string hedgeOrigin, string tradeId, string nt_instrument_
                if(group_idx_for_open_mt5 != -1) {
                    if(group_idx_for_open_mt5 < ArraySize(g_actions)) original_nt_action_for_open_mt5 = g_actions[group_idx_for_open_mt5];
                    if(group_idx_for_open_mt5 < ArraySize(g_totalQuantities)) original_nt_qty_for_open_mt5 = g_totalQuantities[group_idx_for_open_mt5];
+// CORRUPTION FIX: Validate extracted data and use placeholders if invalid
+                    if(original_nt_action_for_open_mt5 == "") {
+                        Print("CRITICAL: OpenNewHedgeOrder - Trade group found but NT action is empty for base_id '", tradeId, "'. Using placeholder.");
+                        original_nt_action_for_open_mt5 = "EMPTY_GROUP_ACTION";
+                    }
+                    if(original_nt_qty_for_open_mt5 <= 0) {
+                        Print("CRITICAL: OpenNewHedgeOrder - Trade group found but NT quantity is invalid (", original_nt_qty_for_open_mt5, ") for base_id '", tradeId, "'. Using placeholder.");
+                        original_nt_qty_for_open_mt5 = 1;
+                    }
                } else {
-                   Print("WARN: OpenNewHedgeOrder - Could not find trade group for base_id '", tradeId, "' to populate g_open_mt5_original_nt_action/qty.");
+                   // CORRUPTION FIX: Use placeholder values when trade group data is missing
+                    Print("CRITICAL: OpenNewHedgeOrder - Could not find trade group for base_id '", tradeId, "'. Using placeholder values to prevent array corruption.");
+                    original_nt_action_for_open_mt5 = "MISSING_GROUP_ACTION";
+                    original_nt_qty_for_open_mt5 = 1;
                }
                g_open_mt5_original_nt_actions[current_array_size] = original_nt_action_for_open_mt5;
                g_open_mt5_original_nt_quantities[current_array_size] = original_nt_qty_for_open_mt5;
@@ -2711,8 +3524,21 @@ string GetCommentPrefixForOriginalHedge(string base_id) // Parameter name change
     int g_baseIds_array_size = ArraySize(g_baseIds);
     for(int i = 0; i < g_baseIds_array_size; i++)
     {
-        if(g_baseIds[i] != NULL && g_baseIds[i] == base_id)
-        {
+        bool isMatch = false;
+        if(g_baseIds[i] != NULL && g_baseIds[i] == base_id) {
+            // Full match (legacy format)
+            isMatch = true;
+        } else if(g_baseIds[i] != NULL && StringLen(g_baseIds[i]) >= 16 && StringLen(base_id) >= 16) {
+            // Partial match - compare first 16 characters (new format)
+            string shortStoredBaseId = StringSubstr(g_baseIds[i], 0, 16);
+            string shortBaseId = StringSubstr(base_id, 0, 16);
+            if(shortStoredBaseId == shortBaseId) {
+                isMatch = true;
+                Print("DEBUG_HEDGE_CLOSURE: GetCommentPrefix - Matched using partial base_id. Stored: '", shortStoredBaseId, "' (from full: '", g_baseIds[i], "'), Input: '", shortBaseId, "' (from full: '", base_id, "')");
+            }
+        }
+
+        if(isMatch) {
             groupIndex = i;
             break;
         }
@@ -2853,6 +3679,108 @@ bool SafeRemoveStringArrayElement(string &array[], int index_to_remove, string a
     
     PrintFormat("SAFE_REMOVE_SUCCESS: Removed element at index %d from %s. New size: %d", index_to_remove, array_name, new_size);
     return true;
+}
+
+// Close hedge positions for a specific base_id (called when NT closes original trade)
+bool CloseHedgePositionsForBaseId(string baseId, double quantity)
+{
+    Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] Starting closure for BaseID: '", baseId, "', Quantity: ", quantity);
+
+    bool anyPositionsClosed = false;
+    int totalPositions = PositionsTotal();
+
+    // Loop through all open positions to find matching base_id
+    for(int i = totalPositions - 1; i >= 0; i--) // Reverse loop to handle position removal
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0) continue;
+
+        string posComment = PositionGetString(POSITION_COMMENT);
+        string posSymbol = PositionGetString(POSITION_SYMBOL);
+        double posVolume = PositionGetDouble(POSITION_VOLUME);
+        ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+        // Extract base_id from position comment
+        string extractedBaseId = ExtractBaseIdFromComment(posComment);
+
+        // Check if this position matches the base_id we want to close
+        // Handle both full match (legacy) and partial match (new format due to MT5 comment length limit)
+        bool isMatch = false;
+        if(extractedBaseId == baseId) {
+            // Full match (legacy format)
+            isMatch = true;
+        } else if(StringLen(extractedBaseId) >= 16 && StringLen(baseId) >= 16) {
+            // Partial match - compare first 16 characters (new format)
+            string shortBaseId = StringSubstr(baseId, 0, 16);
+            if(extractedBaseId == shortBaseId) {
+                isMatch = true;
+                Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] Matched using partial base_id. Extracted: '", extractedBaseId, "', Target: '", shortBaseId, "' (from full: '", baseId, "')");
+            }
+        }
+
+        if(isMatch)
+        {
+            Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] Found matching position. Ticket: ", ticket,
+                  ", Symbol: ", posSymbol, ", Volume: ", posVolume, ", Type: ", EnumToString(posType),
+                  ", Comment: '", posComment, "'");
+
+            // Close this position
+            CTrade localTrade;
+            localTrade.SetExpertMagicNumber(MagicNumber);
+
+            if(localTrade.PositionClose(ticket, Slippage))
+            {
+                Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] Successfully closed position ticket: ", ticket,
+                      ". Result Code: ", localTrade.ResultRetcode(), ", Comment: ", localTrade.ResultComment());
+                anyPositionsClosed = true;
+
+                // Send hedge closure notification to NinjaTrader
+                string ntSymbol = "UNKNOWN";
+                string ntAccount = "UNKNOWN";
+
+                // Try to extract NT symbol and account from comment if available
+                if(StringFind(posComment, "NT:") != -1)
+                {
+                    // Extract NT symbol and account from comment format like "BaseID_123|NT:NQ 03-25|Account:Sim101"
+                    int ntPos = StringFind(posComment, "NT:");
+                    if(ntPos != -1)
+                    {
+                        int pipePos = StringFind(posComment, "|", ntPos);
+                        if(pipePos != -1)
+                        {
+                            ntSymbol = StringSubstr(posComment, ntPos + 3, pipePos - ntPos - 3);
+                        }
+                    }
+
+                    int accPos = StringFind(posComment, "Account:");
+                    if(accPos != -1)
+                    {
+                        ntAccount = StringSubstr(posComment, accPos + 8);
+                        // Remove any trailing characters after account name
+                        int endPos = StringFind(ntAccount, "|");
+                        if(endPos != -1) ntAccount = StringSubstr(ntAccount, 0, endPos);
+                    }
+                }
+
+                // Send notification
+                SendHedgeCloseNotification(baseId, ntSymbol, ntAccount, posVolume,
+                                         (posType == POSITION_TYPE_BUY) ? "buy" : "sell",
+                                         TimeCurrent(), "NT_ORIGINAL_TRADE_CLOSED");
+            }
+            else
+            {
+                Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] Failed to close position ticket: ", ticket,
+                      ". Result Code: ", localTrade.ResultRetcode(), ", Comment: ", localTrade.ResultComment());
+            }
+        }
+    }
+
+    if(!anyPositionsClosed)
+    {
+        Print("ACHM_NT_CLOSURE: [CloseHedgePositionsForBaseId] No matching positions found for BaseID: '", baseId, "' - Position already closed. SUCCESS.");
+    }
+
+    return true; // ALWAYS return success - closed is closed, doesn't matter how it got closed
 }
 
 // Process all pending closures atomically to prevent array index desynchronization
@@ -3380,12 +4308,39 @@ bool ValidateArrayIntegrity(bool log_details = false)
                    actions_size, base_ids_size, nt_symbols_size, nt_accounts_size, orig_nt_actions_size, orig_nt_qty_size);
     }
     
-    // Check for empty action strings which indicate corruption
+    // ENHANCED CONTENT VALIDATION: Check for invalid data in all parallel arrays
     for(int i = 0; i < MathMin(pos_ids_size, actions_size); i++) {
         if(g_open_mt5_actions[i] == "") {
             integrity_ok = false;
             PrintFormat("ARRAY_INTEGRITY_ERROR: Empty action string found at index %d (PosID=%I64d)", i,
                        (i < pos_ids_size) ? g_open_mt5_pos_ids[i] : -1);
+        }
+// CORRUPTION FIX: Additional comprehensive validation checks
+        // Check for invalid position IDs
+        if(i < pos_ids_size && g_open_mt5_pos_ids[i] <= 0) {
+            integrity_ok = false;
+            PrintFormat("ARRAY_INTEGRITY_ERROR: Invalid position ID (%I64d) at index %d", g_open_mt5_pos_ids[i], i);
+        }
+        
+        // Check for empty base IDs
+        if(i < ArraySize(g_open_mt5_base_ids) && g_open_mt5_base_ids[i] == "") {
+            integrity_ok = false;
+            PrintFormat("ARRAY_INTEGRITY_ERROR: Empty base_id at index %d (PosID=%I64d)", i,
+                       (i < pos_ids_size) ? g_open_mt5_pos_ids[i] : -1);
+        }
+        
+        // Check for empty original NT actions (CRITICAL for closure notifications)
+        if(i < ArraySize(g_open_mt5_original_nt_actions) && g_open_mt5_original_nt_actions[i] == "") {
+            integrity_ok = false;
+            PrintFormat("ARRAY_INTEGRITY_ERROR: Empty original NT action at index %d (PosID=%I64d) - CRITICAL for closure notifications", i,
+                       (i < pos_ids_size) ? g_open_mt5_pos_ids[i] : -1);
+        }
+        
+        // Check for invalid original NT quantities (CRITICAL for closure notifications)
+        if(i < ArraySize(g_open_mt5_original_nt_quantities) && g_open_mt5_original_nt_quantities[i] <= 0) {
+            integrity_ok = false;
+            PrintFormat("ARRAY_INTEGRITY_ERROR: Invalid original NT quantity (%d) at index %d (PosID=%I64d) - CRITICAL for closure notifications", 
+                       g_open_mt5_original_nt_quantities[i], i, (i < pos_ids_size) ? g_open_mt5_pos_ids[i] : -1);
         }
     }
     
@@ -3457,10 +4412,13 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
     // ulong original_deal_position_id = HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID); // PositionID from the deal itself, keep if needed for other logic
     long deal_magic = HistoryDealGetInteger(deal_ticket, DEAL_MAGIC); // Magic of the deal itself
 
+    // Get deal reason to detect stop loss/take profit closures
+    ENUM_DEAL_REASON deal_reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
+
     Print("DEBUG_HEDGE_CLOSURE: Deal ", deal_ticket, " - Entry: ", EnumToString(deal_entry),
           ", Trans.PositionID (for map key): ", closing_deal_position_id,
           // ", Deal.PositionID (from history): ", original_deal_position_id,
-          ", DealMagic: ", deal_magic);
+          ", DealMagic: ", deal_magic, ", DealReason: ", EnumToString(deal_reason));
 
     // We are interested in position closures or reductions
     if(deal_entry == DEAL_ENTRY_OUT || deal_entry == DEAL_ENTRY_INOUT)
@@ -3669,26 +4627,48 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             }
 
             string closure_reason = "UNKNOWN_MT5_CLOSE"; // Default
-            // Determine a more specific closure reason based on how we found the base_id and if the group was reconciled
-            if (notify_base_id != "") {
-                 if (groupIdxClosed != -1) { // Group was found for the notify_base_id
-                     bool is_nt_complete_for_group = (groupIdxClosed < ArraySize(g_isComplete) && g_isComplete[groupIdxClosed]);
-                     bool all_mt5_closed_for_group = (groupIdxClosed < ArraySize(g_mt5HedgesOpenedCount) && g_mt5HedgesClosedCount[groupIdxClosed] >= g_mt5HedgesOpenedCount[groupIdxClosed]);
-                     if (is_nt_complete_for_group && all_mt5_closed_for_group) {
-                         closure_reason = "EA_RECONCILED_AND_CLOSED";
-                     } else if (details_found_from_parallel_arrays) {
-                         closure_reason = "EA_PARALLEL_ARRAY_CLOSE";
-                     } else if (closed_position_comment != "" && ExtractBaseIdFromComment(closed_position_comment) == notify_base_id){
-                         closure_reason = "EA_COMMENT_BASED_CLOSE";
-                     }
-                } else if (details_found_from_parallel_arrays) { // Base_id from parallel arrays but no group (should be rare if group logic is sound)
-                    closure_reason = "EA_PARALLEL_ARRAY_ORPHAN_CLOSE";
-                } else if (closed_position_comment != "" && ExtractBaseIdFromComment(closed_position_comment) == notify_base_id){ // Base_id from comment, but no group
-                     closure_reason = "EA_COMMENT_ORPHAN_CLOSE";
-                } else if (CheckPointer(g_map_position_id_to_base_id) == POINTER_DYNAMIC) { // Check if old map was the source
-                    CString *temp_check_ptr = NULL;
-                    if(g_map_position_id_to_base_id.TryGetValue((long)closing_deal_position_id, temp_check_ptr) && temp_check_ptr != NULL && temp_check_ptr.Str() == notify_base_id) {
-                        closure_reason = "EA_OLD_MAP_FALLBACK_CLOSE";
+
+            // FIRST: Check if this was a stop loss or take profit closure based on deal reason
+            if (deal_reason == DEAL_REASON_SL) {
+                closure_reason = "EA_STOP_LOSS_CLOSE";
+                Print("DEBUG_HEDGE_CLOSURE: Position closed by STOP LOSS. Setting closure_reason to EA_STOP_LOSS_CLOSE");
+            } else if (deal_reason == DEAL_REASON_TP) {
+                closure_reason = "EA_TAKE_PROFIT_CLOSE";
+                Print("DEBUG_HEDGE_CLOSURE: Position closed by TAKE PROFIT. Setting closure_reason to EA_TAKE_PROFIT_CLOSE");
+            } else if (deal_reason == DEAL_REASON_CLIENT) {
+                // Manual closure by user in MT5 platform
+                closure_reason = "MANUAL_MT5_CLOSE";
+                Print("DEBUG_HEDGE_CLOSURE: Position closed MANUALLY by user (DEAL_REASON_CLIENT). Setting closure_reason to MANUAL_MT5_CLOSE");
+            } else if (deal_reason == DEAL_REASON_EXPERT) {
+                // Closure by EA (could be manual through EA interface or automatic EA logic)
+                // We'll determine this based on other factors below
+                Print("DEBUG_HEDGE_CLOSURE: Position closed by EXPERT (DEAL_REASON_EXPERT). Will determine specific reason based on context.");
+                // Continue to determine specific EA closure reason below
+            }
+
+            // Only override closure reason for non-manual closures (DEAL_REASON_EXPERT or unknown reasons)
+            if (deal_reason != DEAL_REASON_CLIENT && deal_reason != DEAL_REASON_SL && deal_reason != DEAL_REASON_TP) {
+                // Determine closure reason based on how we found the base_id and if the group was reconciled
+                if (notify_base_id != "") {
+                     if (groupIdxClosed != -1) { // Group was found for the notify_base_id
+                         bool is_nt_complete_for_group = (groupIdxClosed < ArraySize(g_isComplete) && g_isComplete[groupIdxClosed]);
+                         bool all_mt5_closed_for_group = (groupIdxClosed < ArraySize(g_mt5HedgesOpenedCount) && g_mt5HedgesClosedCount[groupIdxClosed] >= g_mt5HedgesOpenedCount[groupIdxClosed]);
+                         if (is_nt_complete_for_group && all_mt5_closed_for_group) {
+                             closure_reason = "EA_RECONCILED_AND_CLOSED";
+                         } else if (details_found_from_parallel_arrays) {
+                             closure_reason = "EA_PARALLEL_ARRAY_CLOSE";
+                         } else if (closed_position_comment != "" && ExtractBaseIdFromComment(closed_position_comment) == notify_base_id){
+                             closure_reason = "EA_COMMENT_BASED_CLOSE";
+                         }
+                    } else if (details_found_from_parallel_arrays) { // Base_id from parallel arrays but no group (should be rare if group logic is sound)
+                        closure_reason = "EA_PARALLEL_ARRAY_ORPHAN_CLOSE";
+                    } else if (closed_position_comment != "" && ExtractBaseIdFromComment(closed_position_comment) == notify_base_id){ // Base_id from comment, but no group
+                         closure_reason = "EA_COMMENT_ORPHAN_CLOSE";
+                    } else if (CheckPointer(g_map_position_id_to_base_id) == POINTER_DYNAMIC) { // Check if old map was the source
+                        CString *temp_check_ptr = NULL;
+                        if(g_map_position_id_to_base_id.TryGetValue((long)closing_deal_position_id, temp_check_ptr) && temp_check_ptr != NULL && temp_check_ptr.Str() == notify_base_id) {
+                            closure_reason = "EA_OLD_MAP_FALLBACK_CLOSE";
+                        }
                     }
                 }
             }

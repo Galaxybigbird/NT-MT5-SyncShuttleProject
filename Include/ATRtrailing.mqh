@@ -9,19 +9,15 @@
 #property strict
 
 // Input parameters for DEMA-ATR trailing stop
-input group    "==== DEMA-ATR Trailing ====";
+input group    "=====DEMA-ATR Trailing=====";
 input int      DEMA_ATR_Period = 14;       // Period for DEMA-ATR calculation
-input double   DEMA_ATR_Multiplier = 1.5;  // ATR trailing distance multiplier
+input double   DEMA_ATR_Multiplier = 1.5;  // DEMA-ATR trailing distance multiplier
 input double   TrailingActivationPercent = 1.0; // Activate trailing at this profit %
 input bool     UseATRTrailing = true;      // Enable DEMA-ATR trailing stop
-input int      TrailingButtonXDistance = 120; // X distance for trailing button position
-input int      TrailingButtonYDistance = 20;  // Y distance for trailing button position
+// These are now set from the EA
+int      TrailingButtonXDistance = 120; // X distance for trailing button position
+int      TrailingButtonYDistance = 20;  // Y distance for trailing button position
 
-input group    "==== Visualization Settings ====";
-input bool     ShowATRLevels = true;       // Show ATR levels on chart
-input color    BuyLevelColor = clrDodgerBlue;  // Color for buy levels
-input color    SellLevelColor = clrCrimson;    // Color for sell levels
-input bool     ShowStatistics = true;      // Show statistics on chart
 input double   MinimumStopDistance = 400.0; // Minimum stop distance in points
 
 // Global variables for button and manual activation
@@ -241,43 +237,134 @@ double CalculateDEMAATR(int period = 0)
 //+------------------------------------------------------------------+
 //| Check if trailing stop should be activated                       |
 //+------------------------------------------------------------------+
+
+// WHACK-A-MOLE FIX: Cache trailing stop checks to prevent excessive logging
+struct TrailingCheckCache {
+    ulong ticket;
+    datetime last_check_time;
+    bool last_result;
+    double last_price;
+    double last_profit_percent;
+};
+
+static TrailingCheckCache g_trailing_cache[];
+static int g_trailing_cache_size = 0;
+static const int TRAILING_CHECK_INTERVAL = 5; // Check every 5 seconds max
+static const double PRICE_CHANGE_THRESHOLD = 0.1; // Only recalculate if price changes by 0.1%
+
+// Helper function to update cache
+void UpdateTrailingCache(ulong ticket, datetime check_time, bool result, double price, double profit_percent)
+{
+    int cache_index = -1;
+
+    // Find existing cache entry
+    for(int i = 0; i < g_trailing_cache_size; i++) {
+        if(g_trailing_cache[i].ticket == ticket) {
+            cache_index = i;
+            break;
+        }
+    }
+
+    // Create new cache entry if not found
+    if(cache_index < 0) {
+        ArrayResize(g_trailing_cache, g_trailing_cache_size + 1);
+        cache_index = g_trailing_cache_size;
+        g_trailing_cache_size++;
+    }
+
+    // Update cache entry
+    g_trailing_cache[cache_index].ticket = ticket;
+    g_trailing_cache[cache_index].last_check_time = check_time;
+    g_trailing_cache[cache_index].last_result = result;
+    g_trailing_cache[cache_index].last_price = price;
+    g_trailing_cache[cache_index].last_profit_percent = profit_percent;
+}
+
 bool ShouldActivateTrailing(ulong ticket, double entryPrice, double currentPrice, string orderType, double volume)
 {
     if(!UseATRTrailing && !ManualTrailingActivated) // Also check manual activation here
     {
-        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Trailing disabled and not manually activated. Skipping.",
-                    IntegerToString(ticket));
+        // Only print this message once per minute to reduce spam
+        static datetime last_disabled_message = 0;
+        if(TimeCurrent() - last_disabled_message > 60) {
+            PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Trailing disabled and not manually activated. Skipping.",
+                        IntegerToString(ticket));
+            last_disabled_message = TimeCurrent();
+        }
         return false;
+    }
+
+    // WHACK-A-MOLE FIX: Check cache first
+    datetime current_time = TimeCurrent();
+    int cache_index = -1;
+
+    // Find existing cache entry
+    for(int i = 0; i < g_trailing_cache_size; i++) {
+        if(g_trailing_cache[i].ticket == ticket) {
+            cache_index = i;
+            break;
+        }
+    }
+
+    // Check if we can use cached result
+    if(cache_index >= 0) {
+        TrailingCheckCache cache_entry = g_trailing_cache[cache_index];
+        double price_change_percent = MathAbs((currentPrice - cache_entry.last_price) / cache_entry.last_price) * 100.0;
+
+        // Use cached result if:
+        // 1. Not enough time has passed AND
+        // 2. Price hasn't changed significantly
+        if((current_time - cache_entry.last_check_time < TRAILING_CHECK_INTERVAL) &&
+           (price_change_percent < PRICE_CHANGE_THRESHOLD)) {
+            return cache_entry.last_result;
+        }
     }
 
     // If manual activation is enabled, it should always activate if UseATRTrailing is true or if manual override is intended
     if(ManualTrailingActivated)
     {
-        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Manual trailing is active. Activation TRUE.",
-                    IntegerToString(ticket));
-        return true; // Manual activation bypasses profit check
+        // Update cache and return true
+        bool result = true;
+        UpdateTrailingCache(ticket, current_time, result, currentPrice, 100.0); // 100% profit for manual mode
+
+        // Only print this message occasionally to reduce spam
+        static datetime last_manual_message = 0;
+        if(TimeCurrent() - last_manual_message > 10) {
+            PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Manual trailing is active. Activation TRUE.",
+                        IntegerToString(ticket));
+            last_manual_message = TimeCurrent();
+        }
+        return result;
     }
 
     // Calculate profit metrics
     double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
     if (accountBalance == 0) // Avoid division by zero
     {
+        bool result = false;
+        UpdateTrailingCache(ticket, current_time, result, currentPrice, 0.0);
         PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - AccountBalance is zero. Cannot calculate profit percent. Activation FALSE.", IntegerToString(ticket));
-        return false;
+        return result;
     }
     double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
     if (pointValue == 0) // Avoid division by zero
     {
+        bool result = false;
+        UpdateTrailingCache(ticket, current_time, result, currentPrice, 0.0);
         PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - PointValue is zero. Cannot calculate profit points. Activation FALSE.", IntegerToString(ticket));
-        return false;
+        return result;
     }
     double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
     double pipValue = tickValue * (pointValue / tickSize); // This might be problematic if tickSize is 0, though unlikely for valid symbols
 
-    // Log inputs
-    PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Checking. OpenPrice: %s, CurrentPrice: %s, Type: %s, Volume: %s",
-                IntegerToString(ticket), DoubleToString(entryPrice, _Digits), DoubleToString(currentPrice, _Digits), orderType, DoubleToString(volume, 2));
+    // WHACK-A-MOLE FIX: Reduce initial logging spam - only log occasionally
+    static datetime last_input_log = 0;
+    if(TimeCurrent() - last_input_log > 60) { // Log inputs only once per minute
+        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Checking. OpenPrice: %s, CurrentPrice: %s, Type: %s, Volume: %s",
+                    IntegerToString(ticket), DoubleToString(entryPrice, _Digits), DoubleToString(currentPrice, _Digits), orderType, DoubleToString(volume, 2));
+        last_input_log = TimeCurrent();
+    }
 
     // Calculate profit in account currency
     double priceDiff = 0;
@@ -297,16 +384,28 @@ bool ShouldActivateTrailing(ulong ticket, double entryPrice, double currentPrice
     // Calculate profit as percentage of account balance
     double profitPercent = (profitCurrency / accountBalance) * 100.0;
 
-    PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Calculated Profit: Points: %s, Currency: %s, Percent: %s%%. Required Percent: %s%%.",
-                IntegerToString(ticket), DoubleToString(profitPoints, 2), DoubleToString(profitCurrency, 2),
-                DoubleToString(profitPercent, 4), DoubleToString(TrailingActivationPercent, 4));
-    
     // Check if profit percentage exceeds activation threshold
     bool activationMet = (profitPercent >= (TrailingActivationPercent - 0.0000001));
-    
-    PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Activation Condition Met: %s.",
-                IntegerToString(ticket), activationMet ? "TRUE" : "FALSE");
-                
+
+    // WHACK-A-MOLE FIX: Update cache with new result
+    UpdateTrailingCache(ticket, current_time, activationMet, currentPrice, profitPercent);
+
+    // WHACK-A-MOLE FIX: Only print detailed logs occasionally to reduce spam
+    static datetime last_detailed_log = 0;
+    bool should_log_details = (TimeCurrent() - last_detailed_log > 30) || activationMet; // Log every 30 seconds or when activated
+
+    if(should_log_details) {
+        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Calculated Profit: Points: %s, Currency: %s, Percent: %s%%. Required Percent: %s%%.",
+                    IntegerToString(ticket), DoubleToString(profitPoints, 2), DoubleToString(profitCurrency, 2),
+                    DoubleToString(profitPercent, 4), DoubleToString(TrailingActivationPercent, 4));
+        PrintFormat("TrailingStop::ShouldActivateTrailing (Ticket: %s) - Activation Condition Met: %s.",
+                    IntegerToString(ticket), activationMet ? "TRUE" : "FALSE");
+
+        if(!activationMet) {
+            last_detailed_log = TimeCurrent();
+        }
+    }
+
     return activationMet;
 }
 
@@ -628,103 +727,30 @@ bool UpdateTrailingStop(ulong ticket, double entryPrice, string orderType)
 //+------------------------------------------------------------------+
 void UpdateVisualization()
 {
-    // Force return immediately, regardless of ShowATRLevels
-    return; // Added this line to completely disable visualization
+    // Clear previous statistics objects
+    ObjectDelete(0, "StatsLabel");
     
-    if(!ShowATRLevels) return;
+    // Draw statistics (always enabled)
+    string statsLabelName = "StatsLabel";
+    ObjectCreate(0, statsLabelName, OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, statsLabelName, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
+    ObjectSetInteger(0, statsLabelName, OBJPROP_XDISTANCE, 150);
+    ObjectSetInteger(0, statsLabelName, OBJPROP_YDISTANCE, 60);
     
-    // Clear previous objects
-    ClearVisualization();
-    
-    // Draw current ATR trailing stop levels
-    double atrValue = CalculateDEMAATR();
-    double trailingDistance = MathMax(atrValue * CurrentATRMultiplier, MinimumStopDistance * Point());
-    
-    double buyTrailingLevel = SymbolInfoDouble(_Symbol, SYMBOL_BID) - trailingDistance;
-    double sellTrailingLevel = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + trailingDistance;
-    
-    // Create objects for trailing levels
-    string buyLevelName = "BuyTrailingLevel";
-    string sellLevelName = "SellTrailingLevel";
-    
-    // Buy trailing level (blue horizontal line)
-    ObjectCreate(0, buyLevelName, OBJ_HLINE, 0, 0, buyTrailingLevel);
-    ObjectSetInteger(0, buyLevelName, OBJPROP_COLOR, BuyLevelColor);
-    ObjectSetInteger(0, buyLevelName, OBJPROP_STYLE, STYLE_DASH);
-    ObjectSetInteger(0, buyLevelName, OBJPROP_WIDTH, 1);
-    ObjectSetString(0, buyLevelName, OBJPROP_TOOLTIP, "Buy Trailing Level: " + DoubleToString(buyTrailingLevel, _Digits));
-    
-    // Sell trailing level (red horizontal line)
-    ObjectCreate(0, sellLevelName, OBJ_HLINE, 0, 0, sellTrailingLevel);
-    ObjectSetInteger(0, sellLevelName, OBJPROP_COLOR, SellLevelColor);
-    ObjectSetInteger(0, sellLevelName, OBJPROP_STYLE, STYLE_DASH);
-    ObjectSetInteger(0, sellLevelName, OBJPROP_WIDTH, 1);
-    ObjectSetString(0, sellLevelName, OBJPROP_TOOLTIP, "Sell Trailing Level: " + DoubleToString(sellTrailingLevel, _Digits));
-    
-    // Draw current ATR value as a label
-    string atrLabelName = "ATRValueLabel";
-    ObjectCreate(0, atrLabelName, OBJ_LABEL, 0, 0, 0);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_XDISTANCE, 150);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_YDISTANCE, 30);
-    ObjectSetString(0, atrLabelName, OBJPROP_TEXT, "ATR: " + DoubleToString(atrValue, 5) + 
-                   " | Distance: " + DoubleToString(trailingDistance, 5) + 
-                   " | Multi: " + DoubleToString(CurrentATRMultiplier, 1) + "x");
-    ObjectSetInteger(0, atrLabelName, OBJPROP_COLOR, clrWhite);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_BGCOLOR, clrDarkSlateGray);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_FONTSIZE, 9);
-    
-    // Draw statistics if enabled
-    if(ShowStatistics)
+    string statsText = "Updates: " + IntegerToString(SuccessfulTrailingUpdates) +
+                     " | Fails: " + IntegerToString(FailedTrailingUpdates);
+                     
+    // Calculate success rate if we have updates
+    if(SuccessfulTrailingUpdates > 0 || FailedTrailingUpdates > 0)
     {
-        string statsLabelName = "StatsLabel";
-        ObjectCreate(0, statsLabelName, OBJ_LABEL, 0, 0, 0);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_XDISTANCE, 150);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_YDISTANCE, 60);
-        
-        string statsText = "Updates: " + IntegerToString(SuccessfulTrailingUpdates) + 
-                         " | Fails: " + IntegerToString(FailedTrailingUpdates);
-                         
-        // Calculate success rate if we have updates
-        if(SuccessfulTrailingUpdates > 0 || FailedTrailingUpdates > 0)
-        {
-            double successRate = 100.0 * SuccessfulTrailingUpdates / (SuccessfulTrailingUpdates + FailedTrailingUpdates);
-            statsText += " | Rate: " + DoubleToString(successRate, 1) + "%";
-        }
-                         
-        ObjectSetString(0, statsLabelName, OBJPROP_TEXT, statsText);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_COLOR, clrWhite);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_BGCOLOR, clrDarkSlateBlue);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_FONTSIZE, 9);
+        double successRate = 100.0 * SuccessfulTrailingUpdates / (SuccessfulTrailingUpdates + FailedTrailingUpdates);
+        statsText += " | Rate: " + DoubleToString(successRate, 1) + "%";
     }
-    
-    // If we have an open position, mark the active trailing stop level
-    int totalPositions = PositionsTotal();
-    for(int i = 0; i < totalPositions; i++)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol)
-        {
-            double currentSL = PositionGetDouble(POSITION_SL);
-            if(currentSL > 0)
-            {
-                string slLineName = "CurrentSL" + IntegerToString(ticket);
-                ObjectCreate(0, slLineName, OBJ_HLINE, 0, 0, currentSL);
-                
-                // Different colors for different positions
-                color slColor = (i == 0) ? clrGold : 
-                              (i == 1) ? clrLightGoldenrod : 
-                              (i == 2) ? clrPaleGoldenrod : clrGold;
-                              
-                ObjectSetInteger(0, slLineName, OBJPROP_COLOR, slColor);
-                ObjectSetInteger(0, slLineName, OBJPROP_STYLE, STYLE_SOLID);
-                ObjectSetInteger(0, slLineName, OBJPROP_WIDTH, 2);
-                ObjectSetString(0, slLineName, OBJPROP_TOOLTIP, "Active SL [" + IntegerToString(ticket) + "]: " + 
-                                DoubleToString(currentSL, _Digits));
-            }
-        }
-    }
+                     
+    ObjectSetString(0, statsLabelName, OBJPROP_TEXT, statsText);
+    ObjectSetInteger(0, statsLabelName, OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, statsLabelName, OBJPROP_BGCOLOR, clrDarkSlateBlue);
+    ObjectSetInteger(0, statsLabelName, OBJPROP_FONTSIZE, 9);
     
     ChartRedraw();
 }
@@ -734,42 +760,8 @@ void UpdateVisualization()
 //+------------------------------------------------------------------+
 void ClearVisualization()
 {
-    // Basic visualization objects
-    ObjectDelete(0, "BuyTrailingLevel");
-    ObjectDelete(0, "SellTrailingLevel");
-    ObjectDelete(0, "ATRValueLabel");
+    // Only clear statistics objects
     ObjectDelete(0, "StatsLabel");
-    
-    // Delete all SL lines for positions
-    for(int i = 0; i < 100; i++) // Increased to handle more positions
-    {
-        ObjectDelete(0, "CurrentSL" + IntegerToString(i));
-    }
-    
-    // Delete any position-specific SL lines based on ticket
-    for(int i = 0; i < PositionsTotal(); i++)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(ticket > 0)
-        {
-            ObjectDelete(0, "CurrentSL" + IntegerToString(ticket));
-        }
-    }
-    
-    // Delete all visualization text labels
-    for(int i = 0; i < ObjectsTotal(0); i++)
-    {
-        string objName = ObjectName(0, i);
-        if(StringFind(objName, "Level") >= 0 || 
-           StringFind(objName, "Label") >= 0 || 
-           StringFind(objName, "ATR") >= 0 ||
-           StringFind(objName, "SL") >= 0)
-        {
-            ObjectDelete(0, objName);
-        }
-    }
-    
-    ChartRedraw();
 }
 
 //+------------------------------------------------------------------+
@@ -795,9 +787,8 @@ void SetATRParameters(double atrMultiplier, int atrPeriod)
     
     Print("ATR Parameters updated - Multiplier: ", atrMultiplier, ", Period: ", atrPeriod);
     
-    // Update visualization if enabled
-    if(ShowATRLevels)
-        UpdateVisualization();
+    // Update visualization (statistics always enabled)
+    UpdateVisualization();
 }
 
 //+------------------------------------------------------------------+
